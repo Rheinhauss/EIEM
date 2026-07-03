@@ -519,6 +519,16 @@ static void __fastcall Hooked_MorphToBoneJob(void *__this, void *param1,
   if (!g_confirmedSMC && param1) {
     g_confirmedSMC = param1;
     Log("[JOB] Confirmed face SMC from MorphToBoneJob: %p", param1);
+
+    if (!s_eyeIKDisabled) {
+      s_eyeIKDisabled = true;
+      __try {
+        *(bool *)((char *)g_confirmedSMC + 0x1dd) = false;
+        Log("[IK-DISABLE] SMC EyeLookAtIK DISABLED at SMC confirm (0x1dd=false)");
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[IK-DISABLE] Failed to disable SMC EyeLookAtIK at confirm");
+      }
+    }
   }
 
   if (s_jobCallCount <= 3) {

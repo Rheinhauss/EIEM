@@ -808,7 +808,7 @@ static void ApplyMmdPoseOnMainThread() {
 
     float mmdCur = ((volatile float *)g_mmdMuscles)[stdIdx];
 
-    if (stdIdx >= 15 && stdIdx <= 20)
+    if (stdIdx >= 19 && stdIdx <= 20)
       continue;
 
     switch (stdIdx) {
@@ -973,6 +973,19 @@ static void ApplyMmdPoseOnMainThread() {
                         Log("[IK-DISABLE] Found BipedIK #%d: %p GO='%s'",
                             s_bipedIKCount, data[i], ikGoName);
                       }
+                      if (strcmp(clsName, "LookAtComponent") == 0 &&
+                          s_lookAtCount < MAX_IK) {
+                        char laGoName[64] = "?";
+                        __try {
+                          if (g_object_get_name) {
+                            void *ns = Invoke(g_object_get_name, go);
+                            if (ns) ReadStrUtf8(ns, laGoName, sizeof(laGoName));
+                          }
+                        } __except (1) {}
+                        s_lookAt[s_lookAtCount++] = data[i];
+                        Log("[IK-DISABLE] Found LookAtComponent #%d: %p GO='%s'",
+                            s_lookAtCount, data[i], laGoName);
+                      }
                       if (strcmp(clsName, "GrounderBipedIK") == 0 &&
                           s_grounderIKCount < MAX_IK) {
                         char gkGoName[64] = "?";
@@ -1101,6 +1114,29 @@ static void ApplyMmdPoseOnMainThread() {
               Invoke(g_animator_set_enabled, s_animatorMono, params);
               Log("[IK-DISABLE] AnimatorMono DISABLED!");
             } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+          }
+
+          for (int la = 0; la < s_lookAtCount; la++) {
+            if (s_lookAt[la] && g_animator_set_enabled) {
+              __try {
+                int falseVal = 0;
+                void *params[] = {&falseVal};
+                Invoke(g_animator_set_enabled, s_lookAt[la], params);
+                Log("[IK-DISABLE] LookAtComponent #%d DISABLED!", la + 1);
+              } __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log("[IK-DISABLE] Failed to disable LookAtComponent #%d", la + 1);
+              }
+            }
+          }
+
+          if (g_confirmedSMC && !s_eyeIKDisabled) {
+            s_eyeIKDisabled = true;
+            __try {
+              *(bool *)((char *)g_confirmedSMC + 0x1dd) = false;
+              Log("[IK-DISABLE] SMC EyeLookAtIK DISABLED (0x1dd=false)");
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+              Log("[IK-DISABLE] Failed to disable SMC EyeLookAtIK");
             }
           }
 

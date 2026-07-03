@@ -99,6 +99,9 @@ static int s_grounderIKCount = 0;
 static void *s_followDamper[4] = {};
 static int s_followDamperCount = 0;
 static void *s_animatorMono = nullptr;
+static void *s_lookAt[MAX_IK] = {};
+static int s_lookAtCount = 0;
+static bool s_eyeIKDisabled = false; 
 
 static void *s_cinemachineBrain = nullptr;  
 static VmdFile *g_cameraVmd = nullptr;      
