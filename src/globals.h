@@ -8,6 +8,12 @@
 #define EIEM_STRINGIFY(x) EIEM_STRINGIFY2(x)
 #define EIEM_VERSION EIEM_STRINGIFY(EIEM_VERSION_MAJOR) "." EIEM_STRINGIFY(EIEM_VERSION_MINOR) "." EIEM_STRINGIFY(EIEM_VERSION_PATCH)
 
+// version.rc includes this header for the version macros only. Keep C++ state
+// out of the Windows resource compiler.
+#ifndef RC_INVOKED
+
+#include <atomic>
+
 static HANDLE g_logHandle = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
 
@@ -72,23 +78,72 @@ typedef void (*fn_InternalHumanPose)(void *nativePtr, void *bodyPos,
 static fn_InternalHumanPose g_icall_SetInternalHumanPose = nullptr;
 
 static fn_InternalAvatarPose orig_GetInternalAvatarPose = nullptr;
-static volatile bool g_trojanActive = false; 
+static std::atomic<bool> g_trojanActive{false};
 static void *g_trojanHookTarget = nullptr;   
-static volatile float g_mmdMuscles[95] = {}; 
-static volatile float g_mmdBodyPos[3] = {};
-static volatile float g_mmdBodyRot[4] = {0, 0, 0,
-                                         1}; 
-static volatile float g_mmdArmBoneRots[ARM_BONE_COUNT * 4] =
-    {}; 
-static volatile bool g_mmdHasArmBones = false;
-static volatile float g_mmdFingerBoneRots[FINGER_BONE_COUNT * 4] =
-    {}; 
-static volatile bool g_mmdHasFingerBones = false;
+
+// The sampler thread publishes a complete pose while the game thread and the
+// HumanPose hook consume it.  Volatile only inhibits some compiler
+// optimizations; it does not make the individual arrays atomic or keep fields
+// from different frames together.  Protect one aggregate so readers always
+// observe a coherent frame.
+struct MmdPoseSnapshot {
+  float muscles[95];
+  float bodyPos[3];
+  float bodyRot[4];
+  float armBoneRots[ARM_BONE_COUNT * 4];
+  float fingerBoneRots[FINGER_BONE_COUNT * 4];
+  bool hasMuscles;
+  bool hasArmBones;
+  bool hasFingerBones;
+};
+
+static SRWLOCK g_mmdPoseLock = SRWLOCK_INIT;
+static MmdPoseSnapshot g_mmdPose = {
+    {}, {}, {0, 0, 0, 1}, {}, {}, false, false, false};
+
+static MmdPoseSnapshot ReadMmdPoseSnapshot() {
+  AcquireSRWLockShared(&g_mmdPoseLock);
+  MmdPoseSnapshot snapshot = g_mmdPose;
+  ReleaseSRWLockShared(&g_mmdPoseLock);
+  return snapshot;
+}
+
+static void PublishMmdPoseSnapshot(const MuscleFrame &frame,
+                                   bool hasArmBones,
+                                   bool hasFingerBones) {
+  AcquireSRWLockExclusive(&g_mmdPoseLock);
+  memcpy(g_mmdPose.muscles, frame.muscles, sizeof(g_mmdPose.muscles));
+  memcpy(g_mmdPose.bodyPos, frame.bodyPos, sizeof(g_mmdPose.bodyPos));
+  memcpy(g_mmdPose.bodyRot, frame.bodyRot, sizeof(g_mmdPose.bodyRot));
+  if (hasArmBones) {
+    memcpy(g_mmdPose.armBoneRots, frame.armBoneRots,
+           sizeof(g_mmdPose.armBoneRots));
+  } else {
+    memset(g_mmdPose.armBoneRots, 0, sizeof(g_mmdPose.armBoneRots));
+  }
+  if (hasFingerBones) {
+    memcpy(g_mmdPose.fingerBoneRots, frame.fingerBoneRots,
+           sizeof(g_mmdPose.fingerBoneRots));
+  } else {
+    memset(g_mmdPose.fingerBoneRots, 0, sizeof(g_mmdPose.fingerBoneRots));
+  }
+  g_mmdPose.hasMuscles = true;
+  g_mmdPose.hasArmBones = hasArmBones;
+  g_mmdPose.hasFingerBones = hasFingerBones;
+  ReleaseSRWLockExclusive(&g_mmdPoseLock);
+}
+
+static void ResetMmdPoseSnapshot() {
+  AcquireSRWLockExclusive(&g_mmdPoseLock);
+  memset(&g_mmdPose, 0, sizeof(g_mmdPose));
+  g_mmdPose.bodyRot[3] = 1.0f;
+  ReleaseSRWLockExclusive(&g_mmdPoseLock);
+}
+
 static void *g_fingerTransforms[FINGER_BONE_COUNT] = {}; 
 static bool g_fingerTransformsResolved = false;
 static float g_gameFingerRest[FINGER_BONE_COUNT * 4] = {};
 static bool g_fingerRestCaptured = false;
-static volatile bool g_mmdHasMuscles = false;
 
 static bool s_ikDisabled = false;
 #define MAX_IK 4
@@ -221,16 +276,16 @@ static float g_audioOffset = 0.0f;
 static int g_audioVolume = 1000;
 static bool g_audioPendingStart = false;
 
-static volatile bool g_guiVisible = false;
+static std::atomic<bool> g_guiVisible{false};
 static HWND g_guiHwnd = nullptr;
-static volatile bool g_guiRunning = false;
+static std::atomic<bool> g_guiRunning{false};
 
-static volatile bool g_updateAvailable = false;   
-static volatile bool g_updateDismissed = false;    
-static volatile bool g_updateChecking = false;     
-static volatile bool g_updateCheckFailed = false;  
-static volatile bool g_updateIsLatest = false;     
-static volatile DWORD g_updateResultTime = 0;      
+static std::atomic<bool> g_updateAvailable{false};
+static std::atomic<bool> g_updateDismissed{false};
+static std::atomic<bool> g_updateChecking{false};
+static std::atomic<bool> g_updateCheckFailed{false};
+static std::atomic<bool> g_updateIsLatest{false};
+static std::atomic<DWORD> g_updateResultTime{0};
 static char g_latestVersion[32] = {};              
 static char g_updateUrl[512] = {};                 
 static char g_updateChangelog[2048] = {};           
@@ -266,7 +321,7 @@ static TransformSet_t g_origSetPos = nullptr;
 static TransformSet_t g_origSetRot = nullptr;       
 static TransformSet_t g_origSetLocalPos = nullptr;  
 static TransformSet_t g_origSetLocalRot = nullptr;  
-static volatile bool g_camSelfWrite = false;        
+static std::atomic<bool> g_camSelfWrite{false};
 static void *g_camHookTransform = nullptr;          
 
 static void Hook_SetPos(void *t, float *v) {
@@ -353,7 +408,7 @@ static FaceBoneSnapshot g_faceRestPose[256];
 static int g_faceBoneCount = 0;
 static bool g_faceBonesCaptured = false;
 static bool g_faceBoneTouched[MAX_FACE_BONES] = {}; 
-static volatile bool g_faceTestActive = false; 
+static std::atomic<bool> g_faceTestActive{false};
 static int g_faceTestFrame = 0;                
 static void *g_faceGetLocalPos = nullptr;
 static void *g_faceSetLocalPos = nullptr;
@@ -420,3 +475,5 @@ static int SafeOff(int resolved, int fallback, const char *name) {
   }
   return fallback;
 }
+
+#endif // RC_INVOKED

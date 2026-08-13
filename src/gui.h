@@ -954,8 +954,10 @@ static void DrawMainPanel() {
   ImGui::Separator();
   ImGui::Spacing();
 
-  bool resultExpired = g_updateResultTime &&
-                       (GetTickCount() - g_updateResultTime > 5000);
+  const DWORD updateResultTime =
+      g_updateResultTime.load(std::memory_order_acquire);
+  bool resultExpired = updateResultTime &&
+                       (GetTickCount() - updateResultTime > 5000);
   if (resultExpired && !g_updateAvailable) {
     g_updateIsLatest = false;
     g_updateCheckFailed = false;
@@ -1475,8 +1477,13 @@ static DWORD WINAPI GuiThread(LPVOID) {
 
 static void ToggleGui() {
   if (!g_guiHwnd) return;
-  g_guiVisible = !g_guiVisible;
-  if (g_guiVisible) {
+  bool previous = g_guiVisible.load(std::memory_order_acquire);
+  while (!g_guiVisible.compare_exchange_weak(
+      previous, !previous, std::memory_order_acq_rel,
+      std::memory_order_acquire)) {
+  }
+  const bool visible = !previous;
+  if (visible) {
     static bool s_firstShow = true;
     if (s_firstShow && g_gameHwnd) {
       RECT gr;
@@ -1503,5 +1510,5 @@ static void ToggleGui() {
     ReturnCursorToGame();
     if (g_gameHwnd) SetForegroundWindow(g_gameHwnd);
   }
-  Log("[GUI] Toggled visibility: %s", g_guiVisible ? "VISIBLE" : "HIDDEN");
+  Log("[GUI] Toggled visibility: %s", visible ? "VISIBLE" : "HIDDEN");
 }

@@ -217,8 +217,8 @@ static void CheckForUpdates() {
       g_updateChangelog[0] = '\0';
     }
 
-    MemoryBarrier();
-    g_updateAvailable = true;
+    // Publish the strings above before the GUI observes the availability flag.
+    g_updateAvailable.store(true, std::memory_order_release);
     g_updateDismissed = false; 
 
     Log("[UPDATE] New version available: v%s -> v%s", EIEM_VERSION, g_latestVersion);
@@ -231,8 +231,8 @@ static void CheckForUpdates() {
     g_updateCheckFailed = true;
   }
 
-  g_updateResultTime = GetTickCount();
-  g_updateChecking = false;
+  g_updateResultTime.store(GetTickCount(), std::memory_order_release);
+  g_updateChecking.store(false, std::memory_order_release);
 }
 
 static DWORD WINAPI UpdateCheckThread(LPVOID) {

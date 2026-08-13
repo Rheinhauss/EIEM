@@ -1059,13 +1059,15 @@ static DWORD WINAPI InitThread(LPVOID) {
 
   DumpCursorMethods();
 
+  // Both worker loops read this flag immediately after creation. Publish it
+  // first so a newly scheduled HotkeyThread cannot observe the old false value
+  // and exit before initialization finishes.
+  g_guiRunning.store(true, std::memory_order_release);
   CreateThread(NULL, 0, HotkeyThread, NULL, 0, NULL);
 
-  g_guiRunning = true;
   CreateThread(NULL, 0, GuiThread, NULL, 0, NULL);
 
   CreateThread(NULL, 0, UpdateCheckThread, NULL, 0, NULL);
 
   return 0;
 }
-

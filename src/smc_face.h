@@ -5,7 +5,7 @@ typedef void (*NativeSetRot_t)(void *transform, float *quat);
 static NativeSetPos_t g_nativeSetPos = nullptr;
 static NativeSetRot_t g_nativeSetRot = nullptr;
 
-static volatile bool g_applyBoneDone = false;
+static std::atomic<bool> g_applyBoneDone{false};
 static void __fastcall Hooked_ApplyBoneTrans(void *__this, bool param1,
                                              float param2, uint64_t jobHandle,
                                              void *methodInfo) {
@@ -263,11 +263,40 @@ static const int NUM_EXTRA_MORPHS =
     sizeof(g_extraMorphs) / sizeof(g_extraMorphs[0]);
 static bool g_extraMorphsResolved = false;
 
+struct FaceWeightSnapshot {
+  float mouth[NUM_MOUTH_SHAPES];
+  float extra[NUM_EXTRA_MORPHS];
+};
+
+// The animation sampler publishes these values while SkeletalMorphCore consumes
+// them on the game thread. A flag alone cannot make the arrays race-free, so
+// copy them as one protected snapshot.
+static SRWLOCK g_faceWeightLock = SRWLOCK_INIT;
+
+static FaceWeightSnapshot ReadFaceWeightSnapshot() {
+  FaceWeightSnapshot snapshot = {};
+  AcquireSRWLockShared(&g_faceWeightLock);
+  memcpy(snapshot.mouth, g_mouthWeights, sizeof(snapshot.mouth));
+  for (int i = 0; i < NUM_EXTRA_MORPHS; i++)
+    snapshot.extra[i] = g_extraMorphs[i].weight;
+  ReleaseSRWLockShared(&g_faceWeightLock);
+  return snapshot;
+}
+
+static void ResetPublishedFaceWeights() {
+  AcquireSRWLockExclusive(&g_faceWeightLock);
+  memset(g_mouthWeights, 0, sizeof(g_mouthWeights));
+  for (int i = 0; i < NUM_EXTRA_MORPHS; i++) {
+    g_extraMorphs[i].weight = 0.0f;
+    g_extraMorphs[i].prevWeight = 0.0f;
+  }
+  ReleaseSRWLockExclusive(&g_faceWeightLock);
+}
+
 static int g_bsIdxA = -1, g_bsIdxI = -1, g_bsIdxU = -1, g_bsIdxE = -1,
            g_bsIdxO = -1;
 static bool g_bsIndicesResolved = false;
-static volatile bool g_mouthWeightsFromMuscle =
-    false; 
+static std::atomic<bool> g_mouthWeightsFromMuscle{false};
 
 static void ResolveMouthShapes(char *smcBase) {
   if (g_mouthShapesResolved)
@@ -681,8 +710,8 @@ static void __fastcall Hooked_SMCUpdate(void *__this, float deltaTime,
   s_frame++;
 
   if (!g_trojanActive && g_mouthWeightsFromMuscle) {
-    g_mouthWeightsFromMuscle = false;
-    memset(g_mouthWeights, 0, sizeof(g_mouthWeights));
+    g_mouthWeightsFromMuscle.store(false, std::memory_order_release);
+    ResetPublishedFaceWeights();
     memset(g_faceBoneTouched, 0, sizeof(g_faceBoneTouched));
     if (g_confirmedSMC && OFF_allMorphBoneDirty > 0) {
       *(bool *)((char *)g_confirmedSMC + OFF_allMorphBoneDirty) = true;
@@ -1160,10 +1189,12 @@ static void __fastcall Hooked_SMCUpdate(void *__this, float deltaTime,
     float blend =
         (1.0f - cosf((t - (int)t) * 3.14159265f)) * 0.5f; 
 
+    AcquireSRWLockExclusive(&g_faceWeightLock);
     for (int s = 0; s < NUM_MOUTH_SHAPES; s++)
       g_mouthWeights[s] = 0.0f;
     g_mouthWeights[baseShape] = 1.0f - blend;
     g_mouthWeights[nextShape] = blend;
+    ReleaseSRWLockExclusive(&g_faceWeightLock);
   }
 
   bool faceActive =
@@ -1178,14 +1209,15 @@ static void __fastcall Hooked_SMCUpdate(void *__this, float deltaTime,
   }
   if (faceActive && g_boneMapReady && g_boneIDMapCount > 0 &&
       g_capturedLen > 0 && g_mouthShapesResolved) {
+    FaceWeightSnapshot faceWeights = ReadFaceWeightSnapshot();
     __try {
       float totalWeight = 0;
       for (int s = 0; s < NUM_MOUTH_SHAPES; s++)
-        totalWeight += g_mouthWeights[s];
+        totalWeight += faceWeights.mouth[s];
       if (totalWeight > 1.0f) {
         float scale = 1.0f / totalWeight;
         for (int s = 0; s < NUM_MOUTH_SHAPES; s++)
-          g_mouthWeights[s] *= scale;
+          faceWeights.mouth[s] *= scale;
       }
 
       memcpy(g_faceBones, g_faceRestPose, sizeof(g_faceBones));
@@ -1196,7 +1228,7 @@ static void __fastcall Hooked_SMCUpdate(void *__this, float deltaTime,
 
       int applied = 0;
       for (int s = 0; s < NUM_MOUTH_SHAPES; s++) {
-        float w = g_mouthWeights[s];
+        float w = faceWeights.mouth[s];
         if (w < 0.001f)
           continue;
         int startIdx = g_mouthShapes[s].jobStartIdx;
@@ -1235,7 +1267,7 @@ static void __fastcall Hooked_SMCUpdate(void *__this, float deltaTime,
 
       if (g_extraMorphsResolved) {
         for (int em = 0; em < NUM_EXTRA_MORPHS; em++) {
-          float w = g_extraMorphs[em].weight;
+          float w = faceWeights.extra[em];
           if (w < 0.001f)
             continue;
 
@@ -1338,8 +1370,8 @@ static void __fastcall Hooked_SMCUpdate(void *__this, float deltaTime,
       if (g_faceTestFrame % 300 == 0) {
         Log("[MOUTH] Blended: A=%.2f I=%.2f U=%.2f E=%.2f O=%.2f, total "
             "deltas=%d",
-            g_mouthWeights[0], g_mouthWeights[1], g_mouthWeights[2],
-            g_mouthWeights[3], g_mouthWeights[4], applied);
+            faceWeights.mouth[0], faceWeights.mouth[1], faceWeights.mouth[2],
+            faceWeights.mouth[3], faceWeights.mouth[4], applied);
       }
     } __except (1) {
       Log("[MOUTH] Exception");

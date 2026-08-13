@@ -301,7 +301,7 @@ static void BuildDynamicMuscleMap() {
   }
 }
 
-static volatile bool g_trojanReentrant = false;
+static std::atomic<bool> g_trojanReentrant{false};
 static void *g_gameNativePtr =
     nullptr; 
 
@@ -363,13 +363,22 @@ static void __cdecl Hooked_GetInternalAvatarPose(void *nativePtr, void *array,
     orig_GetInternalAvatarPose(nativePtr, array, count);
   }
 
-  if (!g_trojanActive || !g_mmdHasMuscles)
+  if (!g_trojanActive.load(std::memory_order_acquire))
     return;
-  if (g_trojanReentrant)
+
+  const MmdPoseSnapshot mmdPose = ReadMmdPoseSnapshot();
+  if (!mmdPose.hasMuscles)
     return;
 
   if (g_cachedMPtr && nativePtr == g_cachedMPtr)
     return;
+
+  bool expected = false;
+  if (!g_trojanReentrant.compare_exchange_strong(
+          expected, true, std::memory_order_acquire,
+          std::memory_order_relaxed)) {
+    return;
+  }
 
   if (!g_gameNativePtr) {
     g_gameNativePtr = nativePtr;
@@ -377,15 +386,15 @@ static void __cdecl Hooked_GetInternalAvatarPose(void *nativePtr, void *array,
         nativePtr, g_cachedMPtr, count);
   }
 
-  if (nativePtr != g_gameNativePtr)
+  if (nativePtr != g_gameNativePtr) {
+    g_trojanReentrant.store(false, std::memory_order_release);
     return;
-
-  g_trojanReentrant = true;
+  }
 
 
   if (g_icall_SetInternalHumanPose && s_poseReady && s_musclePtr &&
       g_cachedMPtr) {
-    memcpy(s_musclePtr, (void *)g_mmdMuscles, 95 * sizeof(float));
+    memcpy(s_musclePtr, mmdPose.muscles, sizeof(mmdPose.muscles));
 
     float bodyPos[3] = {s_cachedPose.bodyPosX, s_cachedPose.bodyPosY,
                         s_cachedPose.bodyPosZ};
@@ -435,12 +444,12 @@ static void __cdecl Hooked_GetInternalAvatarPose(void *nativePtr, void *array,
       }
     }
 
-    if (g_mmdHasArmBones && g_muscleAnim && g_muscleAnim->hasArmBones) {
+    if (mmdPose.hasArmBones && g_muscleAnim && g_muscleAnim->hasArmBones) {
 
       static const int armHBB[ARM_BONE_COUNT] = {13, 15, 17, 14, 16, 18};
 
       for (int i = 0; i < ARM_BONE_COUNT; i++) {
-        float *mmdCur = (float *)&g_mmdArmBoneRots[i * 4];
+        const float *mmdCur = &mmdPose.armBoneRots[i * 4];
         float *mmdRest = &g_muscleAnim->armRestRots[i * 4];
 
         int boneIdx = armHBB[i];
@@ -491,19 +500,36 @@ static void __cdecl Hooked_GetInternalAvatarPose(void *nativePtr, void *array,
     if (s_logCount <= 3 || (s_logCount % 300 == 0 && s_logCount <= 3000)) {
       Log("[TROJAN] #%d: direct icall applied! m[0]=%.3f m[42]=%.3f "
           "armOverride=%s",
-          s_logCount, (float)g_mmdMuscles[0], (float)g_mmdMuscles[42],
-          g_mmdHasArmBones ? "YES" : "no");
+          s_logCount, mmdPose.muscles[0], mmdPose.muscles[42],
+          mmdPose.hasArmBones ? "YES" : "no");
     }
   }
 
-  g_trojanReentrant = false;
+  g_trojanReentrant.store(false, std::memory_order_release);
 }
 
 #define WM_MMD_APPLY_POSE (WM_USER + 1)
 
 static WNDPROC g_origWndProc = nullptr;
-static volatile bool g_mmdPendingApply = false;
-static volatile bool g_mmdSetMode = false;
+static std::atomic<bool> g_mmdPendingApply{false};
+
+static bool QueueMmdPoseApply() {
+  if (!g_gameHwnd)
+    return false;
+
+  bool expected = false;
+  if (!g_mmdPendingApply.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    return false;
+  }
+
+  if (!PostMessageW(g_gameHwnd, WM_MMD_APPLY_POSE, 0, 0)) {
+    g_mmdPendingApply.store(false, std::memory_order_release);
+    return false;
+  }
+  return true;
+}
 
 typedef void *(*InvokerFn)(void *methodPtr, void *method, void *obj,
                            void **params, void *retval);
@@ -630,7 +656,8 @@ static void InitMmdPoseOnMainThread() {
       s_musclePtr[87], s_musclePtr[88], s_musclePtr[89], s_musclePtr[90],
       s_musclePtr[91], s_musclePtr[92], s_musclePtr[93], s_musclePtr[94]);
 
-  memcpy(s_musclePtr, (void *)g_mmdMuscles, 95 * sizeof(float));
+  const MmdPoseSnapshot mmdPose = ReadMmdPoseSnapshot();
+  memcpy(s_musclePtr, mmdPose.muscles, sizeof(mmdPose.muscles));
   *g_slotAddr = g_slotSetFn;
   void *setArgs[] = {&s_cachedPose};
   void *setExc = nullptr;
@@ -646,9 +673,12 @@ static void ApplyMmdPoseDirect() {
   if (!s_poseReady || !s_directSetHP || !g_cachedMPtr)
     return;
 
-  SafeSetAnimatorEnabled(false);
+  const MmdPoseSnapshot mmdPose = ReadMmdPoseSnapshot();
+  if (!mmdPose.hasMuscles)
+    return;
 
-  memcpy(s_musclePtr, (void *)g_mmdMuscles, 95 * sizeof(float));
+  SafeSetAnimatorEnabled(false);
+  memcpy(s_musclePtr, mmdPose.muscles, sizeof(mmdPose.muscles));
 
   float bodyPos[3] = {s_cachedPose.bodyPosX, s_cachedPose.bodyPosY,
                       s_cachedPose.bodyPosZ};
@@ -665,10 +695,7 @@ static void ApplyMmdPoseDirect() {
           GetExceptionCode());
       s_errLogged = true;
     }
-    if (g_gameHwnd && !g_mmdPendingApply) {
-      g_mmdPendingApply = true;
-      PostMessageW(g_gameHwnd, WM_MMD_APPLY_POSE, 0, 0);
-    }
+    QueueMmdPoseApply();
     return;
   }
 
@@ -676,8 +703,7 @@ static void ApplyMmdPoseDirect() {
   s_frameCount++;
   if (s_frameCount <= 3 || (s_frameCount % 300 == 0 && s_frameCount <= 3000)) {
     Log("[MMD-DIRECT] #%d: m[0]=%.3f m[21]=%.3f m[42]=%.3f", s_frameCount,
-        (float)g_mmdMuscles[0], (float)g_mmdMuscles[21],
-        (float)g_mmdMuscles[42]);
+        mmdPose.muscles[0], mmdPose.muscles[21], mmdPose.muscles[42]);
   }
 }
 
@@ -691,15 +717,14 @@ struct CachedBoneState {
 static CachedBoneState g_cachedBones[MAX_HUMAN_BONES] = {};
 static Vec3 g_cachedHipsPos = {};
 static void *g_hipsTransform = nullptr;
-static volatile bool g_bonesReady = false; 
-static volatile int g_boneGeneration = 0;  
+static std::atomic<bool> g_bonesReady{false};
+static std::atomic<int> g_boneGeneration{0};
 
-static volatile int g_debugMuscleIdx = 0;      
-static volatile float g_debugMuscleVal = 0.0f; 
-static volatile bool g_debugMode = false;
-static volatile bool g_debugDirty = true; 
-static volatile int g_debugMaxIdx =
-    95; 
+static std::atomic<int> g_debugMuscleIdx{0};
+static std::atomic<float> g_debugMuscleVal{0.0f};
+static std::atomic<bool> g_debugMode{false};
+static std::atomic<bool> g_debugDirty{true};
+static std::atomic<int> g_debugMaxIdx{95};
 
 
 static int StandardToGame(int stdIdx) {
@@ -760,16 +785,14 @@ static void ApplyMmdPoseOnMainThread() {
     return;
   }
 
+  const MmdPoseSnapshot mmdPose = ReadMmdPoseSnapshot();
+  if (!mmdPose.hasMuscles)
+    return;
 
   if (s_firstFrame) {
-    memcpy(s_mmdFirstMuscles, (void *)g_mmdMuscles, 95 * sizeof(float));
-    s_mmdFirstBodyPos[0] = g_mmdBodyPos[0];
-    s_mmdFirstBodyPos[1] = g_mmdBodyPos[1];
-    s_mmdFirstBodyPos[2] = g_mmdBodyPos[2];
-    s_mmdFirstBodyRot[0] = g_mmdBodyRot[0];
-    s_mmdFirstBodyRot[1] = g_mmdBodyRot[1];
-    s_mmdFirstBodyRot[2] = g_mmdBodyRot[2];
-    s_mmdFirstBodyRot[3] = g_mmdBodyRot[3];
+    memcpy(s_mmdFirstMuscles, mmdPose.muscles, sizeof(mmdPose.muscles));
+    memcpy(s_mmdFirstBodyPos, mmdPose.bodyPos, sizeof(mmdPose.bodyPos));
+    memcpy(s_mmdFirstBodyRot, mmdPose.bodyRot, sizeof(mmdPose.bodyRot));
     Log("[REMAP] 95—01 remapping active. First frame captured.");
     Log("[REMAP] MMD arm39→game%d arm48→game%d "
         "fore42→game%d",
@@ -806,7 +829,7 @@ static void ApplyMmdPoseOnMainThread() {
     if (gameIdx < 0 || gameIdx >= mc)
       continue;
 
-    float mmdCur = ((volatile float *)g_mmdMuscles)[stdIdx];
+    float mmdCur = mmdPose.muscles[stdIdx];
 
     if (stdIdx >= 19 && stdIdx <= 20)
       continue;
@@ -844,17 +867,17 @@ static void ApplyMmdPoseOnMainThread() {
     s_musclePtr[gameIdx] = mmdCur;
   }
 
-  float motDx = (g_mmdBodyPos[0] - s_mmdFirstBodyPos[0]) * g_motionScale;
-  float motDy = (g_mmdBodyPos[1] - s_mmdFirstBodyPos[1]) * g_motionScale;
-  float motDz = (g_mmdBodyPos[2] - s_mmdFirstBodyPos[2]) * g_motionScale;
+  float motDx = (mmdPose.bodyPos[0] - s_mmdFirstBodyPos[0]) * g_motionScale;
+  float motDy = (mmdPose.bodyPos[1] - s_mmdFirstBodyPos[1]) * g_motionScale;
+  float motDz = (mmdPose.bodyPos[2] - s_mmdFirstBodyPos[2]) * g_motionScale;
   s_cachedPose.bodyPosX = g_restBodyPos[0] + motDx + g_posOffsetX;
   s_cachedPose.bodyPosY = g_restBodyPos[1] + motDy + g_posOffsetY;
   s_cachedPose.bodyPosZ = g_restBodyPos[2] + motDz + g_posOffsetZ;
 
-  s_cachedPose.bodyRotX = g_mmdBodyRot[0];
-  s_cachedPose.bodyRotY = g_mmdBodyRot[1];
-  s_cachedPose.bodyRotZ = g_mmdBodyRot[2];
-  s_cachedPose.bodyRotW = g_mmdBodyRot[3];
+  s_cachedPose.bodyRotX = mmdPose.bodyRot[0];
+  s_cachedPose.bodyRotY = mmdPose.bodyRot[1];
+  s_cachedPose.bodyRotZ = mmdPose.bodyRot[2];
+  s_cachedPose.bodyRotW = mmdPose.bodyRot[3];
 
   if (g_yawOffsetDeg != 0.0f) {
     float yawRad = g_yawOffsetDeg * 3.14159265f / 180.0f;
@@ -886,7 +909,7 @@ static void ApplyMmdPoseOnMainThread() {
                         &setExc);
   *g_slotAddr = g_slotOrigGet;
 
-  if (g_mmdHasArmBones && g_muscleAnim && g_muscleAnim->hasArmBones &&
+  if (mmdPose.hasArmBones && g_muscleAnim && g_muscleAnim->hasArmBones &&
       g_cachedAnimator) {
 
     if (!s_ikDisabled) {
@@ -1228,7 +1251,8 @@ static void ApplyMmdPoseOnMainThread() {
       s_skirtDirty = true;
       ApplySkirtColliderScale();
     }
-  if (g_mmdHasFingerBones && g_muscleAnim && g_muscleAnim->hasFingerBones) {
+  if (mmdPose.hasFingerBones && g_muscleAnim &&
+      g_muscleAnim->hasFingerBones) {
     if (!g_fingerTransformsResolved) {
       g_fingerTransformsResolved = true;
       static const char *fingerNames[FINGER_BONE_COUNT] = {
@@ -1286,7 +1310,7 @@ static void ApplyMmdPoseOnMainThread() {
     for (int i = 0; i < FINGER_BONE_COUNT; i++) {
       if (!g_fingerTransforms[i])
         continue;
-      float *mmdCur = (float *)&g_mmdFingerBoneRots[i * 4];
+      const float *mmdCur = &mmdPose.fingerBoneRots[i * 4];
       float *mmdRest = &g_muscleAnim->fingerRestRots[i * 4];
 
       float cx = mmdCur[0], cy = mmdCur[1], cz = mmdCur[2], cw = mmdCur[3];
@@ -1371,9 +1395,9 @@ static void ApplyMmdPoseOnMainThread() {
   if (s_cnt <= 3 || (s_cnt % 300 == 0 && s_cnt <= 3000)) {
     int g39 = StandardToGame(39), g48 = StandardToGame(48),
         g42 = StandardToGame(42);
-    float dxPos = g_mmdBodyPos[0] - s_mmdFirstBodyPos[0];
-    float dyPos = g_mmdBodyPos[1] - s_mmdFirstBodyPos[1];
-    float dzPos = g_mmdBodyPos[2] - s_mmdFirstBodyPos[2];
+    float dxPos = mmdPose.bodyPos[0] - s_mmdFirstBodyPos[0];
+    float dyPos = mmdPose.bodyPos[1] - s_mmdFirstBodyPos[1];
+    float dzPos = mmdPose.bodyPos[2] - s_mmdFirstBodyPos[2];
     Log("[MMD] #%d: arm39→g%d=%.2f arm48→g%d=%.2f "
         "fore42→g%d=%.2f bodyD=(%.3f,%.3f,%.3f) exc=%s",
         s_cnt, g39, s_musclePtr[g39], g48, s_musclePtr[g48], g42,
@@ -1596,7 +1620,7 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     if (s_poseReady) {
       ApplyMmdPoseOnMainThread();
     }
-    g_mmdPendingApply = false;
+    g_mmdPendingApply.store(false, std::memory_order_release);
     return 0;
   }
   if (msg >= (WM_USER + 100) && msg <= (WM_USER + 109)) {
@@ -1649,18 +1673,14 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         if (g_musclePlayer->playing) g_musclePlayer->TogglePause();
         g_musclePlayer->Stop();
         g_trojanActive = false;
-        g_mouthWeightsFromMuscle = false;
-        memset(g_mouthWeights, 0, sizeof(g_mouthWeights));
+        g_mouthWeightsFromMuscle.store(false, std::memory_order_release);
+        ResetPublishedFaceWeights();
         CleanupPoseHandler();
         RestoreBigList();
         if (g_confirmedSMC && OFF_allMorphBoneDirty > 0) {
           *(bool *)((char *)g_confirmedSMC + OFF_allMorphBoneDirty) = true;
         }
         memset(g_faceBoneTouched, 0, sizeof(g_faceBoneTouched));
-        for (int i = 0; i < NUM_EXTRA_MORPHS; i++) {
-          g_extraMorphs[i].weight = 0;
-          g_extraMorphs[i].prevWeight = 0;
-        }
         RestoreDisabledComponents();
         RestoreSkirtColliders();
         SafeSetAnimatorEnabled(true);
@@ -1745,15 +1765,13 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       }
       g_cachedAnimator = nullptr;
       s_poseReady = false;
-      g_mmdHasMuscles = false;
-      g_mmdHasArmBones = false;
-      g_mmdHasFingerBones = false;
+      ResetMmdPoseSnapshot();
       g_fingerTransformsResolved = false;
       g_fingerRestCaptured = false;
       memset(g_fingerTransforms, 0, sizeof(g_fingerTransforms));
-      g_mouthWeightsFromMuscle = false;
+      g_mouthWeightsFromMuscle.store(false, std::memory_order_release);
       g_bsIndicesResolved = false;
-      memset(g_mouthWeights, 0, sizeof(g_mouthWeights));
+      ResetPublishedFaceWeights();
       RefreshEntityAnimator();
       if (g_cachedAnimator) {
         Log("[GUI-CMD] New character captured: animator=%p", g_cachedAnimator);
@@ -1839,20 +1857,8 @@ static void MuscleAnimationTick() {
       frameNum / g_muscleAnim->fps; 
   MuscleFrame mf = g_muscleAnim->GetFrame(timeSec);
 
-  memcpy((void *)g_mmdMuscles, mf.muscles, 95 * sizeof(float));
-  memcpy((void *)g_mmdBodyPos, mf.bodyPos, 3 * sizeof(float));
-  memcpy((void *)g_mmdBodyRot, mf.bodyRot, 4 * sizeof(float));
-  if (g_muscleAnim->hasArmBones) {
-    memcpy((void *)g_mmdArmBoneRots, mf.armBoneRots,
-           ARM_BONE_COUNT * 4 * sizeof(float));
-    g_mmdHasArmBones = true;
-  }
-  if (g_muscleAnim->hasFingerBones) {
-    memcpy((void *)g_mmdFingerBoneRots, mf.fingerBoneRots,
-           FINGER_BONE_COUNT * 4 * sizeof(float));
-    g_mmdHasFingerBones = true;
-  }
-  g_mmdHasMuscles = true;
+  PublishMmdPoseSnapshot(mf, g_muscleAnim->hasArmBones,
+                         g_muscleAnim->hasFingerBones);
 
   if (!g_vmd && !g_bsIndicesResolved) {
     g_bsIndicesResolved = true; 
@@ -1958,6 +1964,7 @@ static void MuscleAnimationTick() {
     static float s_mouthAlpha =
         0.25f; 
 
+    AcquireSRWLockExclusive(&g_faceWeightLock);
     for (int i = 0; i < 5; i++) {
       float target = 0.0f;
       auto it = g_vmd->morphTimelines.find(morphNames[i]);
@@ -1969,7 +1976,6 @@ static void MuscleAnimationTick() {
       s_prevMouthWeights[i] = smoothed;
       g_mouthWeights[i] = smoothed;
     }
-    g_mouthWeightsFromMuscle = true;
 
     static float s_extraAlpha = 0.25f;
     for (int em = 0; em < NUM_EXTRA_MORPHS; em++) {
@@ -1983,12 +1989,11 @@ static void MuscleAnimationTick() {
       g_extraMorphs[em].prevWeight = smoothed;
       g_extraMorphs[em].weight = smoothed;
     }
+    ReleaseSRWLockExclusive(&g_faceWeightLock);
+    g_mouthWeightsFromMuscle.store(true, std::memory_order_release);
   }
 
-  if (g_gameHwnd) {
-    g_mmdPendingApply = true;
-    PostMessageW(g_gameHwnd, WM_MMD_APPLY_POSE, 0, 0);
-  }
+  QueueMmdPoseApply();
 
   static bool s_logged = false;
   if (!s_logged) {
@@ -2101,4 +2106,3 @@ static void AnimationTick() {
     dumpF = nullptr;
   }
 }
-
