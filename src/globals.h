@@ -226,6 +226,7 @@ static std::atomic<int> g_directUnsupportedBones{0};
 static std::atomic<uint32_t> g_directTotalFrames{0};
 static std::atomic<int> g_directMorphTracks{0};
 static std::atomic<int> g_directCameraKeys{0};
+static std::atomic<int> g_directIkTracks{0};
 static std::atomic<bool> g_directReady{false};
 static char g_directLastError[256] = {};
 

@@ -42,11 +42,44 @@ struct DirectPoseBone {
   bool hasPosition = false;
 };
 
+struct DirectIkBinding {
+  void *upperLeg = nullptr;
+  void *lowerLeg = nullptr;
+  void *foot = nullptr;
+  void *toes = nullptr;
+  const VmdBoneTimeline *footTimeline = nullptr;
+  const VmdBoneTimeline *toeTimeline = nullptr;
+  std::string footTrackName;
+  std::string toeTrackName;
+  Vec3 bindFootFromRoot = {0, 0, 0};
+  Vec3 bindToeFromFoot = {0, 0, 0};
+  Vec3 bindPoleFromUpperParent = {0, 0, 1};
+  mutable Vec3 targetFootFromRoot = {0, 0, 0};
+  mutable Vec3 targetToeFromFoot = {0, 0, 0};
+  mutable bool targetCalibrated = false;
+  float upperLength = 0.0f;
+  float lowerLength = 0.0f;
+  bool legValid = false;
+  bool toeValid = false;
+};
+
+struct DirectPoseIk {
+  bool legEnabled = false;
+  bool toeEnabled = false;
+  float weight = 1.0f;
+  Vec3 allParentOffsetRoot = {0, 0, 0};
+  Vec3 footOffsetRoot = {0, 0, 0};
+  Vec3 toeOffsetRoot = {0, 0, 0};
+  Quat allParentRotationRoot = {0, 0, 0, 1};
+  Quat footRotationRoot = {0, 0, 0, 1};
+};
+
 struct DirectPoseFrame {
   uint32_t generation = 0;
   float timeSeconds = 0.0f;
   float frame = 0.0f;
   std::vector<DirectPoseBone> bones;
+  DirectPoseIk ik[2] = {};
 };
 
 struct DirectMapEntry {
@@ -125,10 +158,13 @@ static const DirectMapEntry g_directMap[] = {
 struct DirectVmdMotion {
   VmdFile *vmd = nullptr;
   std::vector<DirectBoneBinding> bindings;
+  void *rootTransform = nullptr;
+  DirectIkBinding ikBindings[2] = {};
   uint32_t durationFrames = 0;
   int mappedTracks = 0;
   int unmappedTracks = 0;
   int unsupportedTracks = 0;
+  int ikTracks = 0;
   float positionScale = 0.08f;
   Quat rootBasis = {0, 0, 0, 1};
   bool prepared = false;
@@ -345,6 +381,121 @@ struct DirectVmdMotion {
     }
   }
 
+  const VmdBoneTimeline *FindIkTrack(bool right, bool toe,
+                                     std::string &matchedName) const {
+    static const char *const names[2][2][2] = {
+        {{u8"\u5de6\u8db3\uff29\uff2b", u8"\u5de6\u8db3IK"},
+         {u8"\u5de6\u3064\u307e\u5148\uff29\uff2b",
+          u8"\u5de6\u3064\u307e\u5148IK"}},
+        {{u8"\u53f3\u8db3\uff29\uff2b", u8"\u53f3\u8db3IK"},
+         {u8"\u53f3\u3064\u307e\u5148\uff29\uff2b",
+          u8"\u53f3\u3064\u307e\u5148IK"}},
+    };
+    for (const char *candidate : names[right ? 1 : 0][toe ? 1 : 0]) {
+      const auto it = vmd->boneTimelines.find(candidate);
+      if (it != vmd->boneTimelines.end()) {
+        matchedName = it->first;
+        return &it->second;
+      }
+    }
+    return nullptr;
+  }
+
+  void BuildIkBindings(std::vector<std::string> &seen) {
+    ikTracks = 0;
+    for (int side = 0; side < 2; ++side) {
+      const bool right = side != 0;
+      DirectIkBinding &chain = ikBindings[side];
+      chain = {};
+      chain.upperLeg = SafeGetBoneTransform(
+          right ? HB_RightUpperLeg : HB_LeftUpperLeg);
+      chain.lowerLeg = SafeGetBoneTransform(
+          right ? HB_RightLowerLeg : HB_LeftLowerLeg);
+      chain.foot = SafeGetBoneTransform(right ? HB_RightFoot : HB_LeftFoot);
+      chain.toes = SafeGetBoneTransform(right ? HB_RightToes : HB_LeftToes);
+      chain.legValid = chain.upperLeg && chain.lowerLeg && chain.foot;
+      chain.toeValid = chain.legValid && chain.toes;
+
+      chain.footTimeline =
+          FindIkTrack(right, false, chain.footTrackName);
+      if (chain.footTimeline) {
+        seen.push_back(chain.footTrackName);
+        if (chain.legValid) {
+          ++mappedTracks;
+          ++ikTracks;
+        } else {
+          ++unmappedTracks;
+        }
+      }
+      chain.toeTimeline = FindIkTrack(right, true, chain.toeTrackName);
+      if (chain.toeTimeline) {
+        seen.push_back(chain.toeTrackName);
+        if (chain.toeValid) {
+          ++mappedTracks;
+          ++ikTracks;
+        } else {
+          ++unmappedTracks;
+        }
+      }
+    }
+  }
+
+  bool CaptureIkBinding(DirectIkBinding &chain, Vec3 rootPosition,
+                        Quat rootWorld) {
+    if (!chain.legValid)
+      return false;
+    Vec3 upperPosition, kneePosition, footPosition;
+    if (!ReadWorldPosition(chain.upperLeg, upperPosition) ||
+        !ReadWorldPosition(chain.lowerLeg, kneePosition) ||
+        !ReadWorldPosition(chain.foot, footPosition)) {
+      chain.legValid = chain.toeValid = false;
+      return false;
+    }
+    const Vec3 upperVector = Vec3Sub(kneePosition, upperPosition);
+    const Vec3 lowerVector = Vec3Sub(footPosition, kneePosition);
+    chain.upperLength = sqrtf(Vec3Dot(upperVector, upperVector));
+    chain.lowerLength = sqrtf(Vec3Dot(lowerVector, lowerVector));
+    if (chain.upperLength < 1e-4f || chain.lowerLength < 1e-4f) {
+      chain.legValid = chain.toeValid = false;
+      return false;
+    }
+
+    const Quat rootInverse = QuatInv(rootWorld);
+    chain.bindFootFromRoot = QuatRotate(
+        rootInverse, Vec3Sub(footPosition, rootPosition));
+    chain.targetFootFromRoot = chain.bindFootFromRoot;
+    chain.targetCalibrated = false;
+    const Vec3 hipToFoot = Vec3Normalize(Vec3Sub(footPosition, upperPosition));
+    Vec3 poleWorld = Vec3Sub(
+        upperVector, Vec3Scale(hipToFoot, Vec3Dot(upperVector, hipToFoot)));
+    if (Vec3Dot(poleWorld, poleWorld) < 1e-8f)
+      poleWorld = QuatRotate(rootWorld, {0, 0, 1});
+    Quat upperParentWorld = rootWorld;
+    void *upperParent = DirectGetParentTransform(chain.upperLeg);
+    if (upperParent)
+      ReadWorldRotation(upperParent, upperParentWorld);
+    chain.bindPoleFromUpperParent = Vec3Normalize(
+        QuatRotate(QuatInv(upperParentWorld), poleWorld));
+
+    if (chain.toeValid) {
+      Vec3 toePosition;
+      if (ReadWorldPosition(chain.toes, toePosition)) {
+        chain.bindToeFromFoot = QuatRotate(
+            rootInverse, Vec3Sub(toePosition, footPosition));
+        chain.targetToeFromFoot = chain.bindToeFromFoot;
+      } else {
+        chain.toeValid = false;
+      }
+    }
+    return true;
+  }
+
+  bool SampleIkEnabled(const std::string &name, float frame) const {
+    const auto it = vmd->ikTimelines.find(name);
+    return it == vmd->ikTimelines.end() ? true
+                                        : it->second.Sample(frame, true);
+  }
+
   bool BuildBindings() {
     if (!vmd || !vmd->loaded || !g_cachedAnimator) {
       error = "No loaded VMD or active character Animator";
@@ -357,11 +508,13 @@ struct DirectVmdMotion {
     }
 
     bindings.clear();
-    mappedTracks = unmappedTracks = unsupportedTracks = 0;
+    rootTransform = root;
+    mappedTracks = unmappedTracks = unsupportedTracks = ikTracks = 0;
     std::vector<std::string> seen;
     for (const auto &entry : g_directMap)
       AddTrack(entry, root, seen);
     AddFingerTracks(root, seen);
+    BuildIkBindings(seen);
 
     for (const auto &timeline : vmd->boneTimelines) {
       if (std::find(seen.begin(), seen.end(), timeline.first) != seen.end())
@@ -400,6 +553,17 @@ struct DirectVmdMotion {
                 });
     }
 
+    Vec3 rootPosition = {0, 0, 0};
+    if (hasRootWorld && ReadWorldPosition(root, rootPosition)) {
+      for (DirectIkBinding &chain : ikBindings)
+        CaptureIkBinding(chain, rootPosition, rootWorld);
+    } else {
+      for (DirectIkBinding &chain : ikBindings)
+        chain.legValid = chain.toeValid = false;
+    }
+    Log("[VMD-DIRECT] Standard leg IK tracks: %d mapped, display timelines=%zu",
+        ikTracks, vmd->ikTimelines.size());
+
     // MMD lower/upper body are siblings below center/groove, while Humanoid
     // Spine is a child of Hips. Mark the earliest available upper-body layer
     // so Sample() can remove the lower-body rotation inherited through Hips.
@@ -428,6 +592,78 @@ struct DirectVmdMotion {
     SafeSetAnimatorEnabled(false);
     prepared = true;
     return true;
+  }
+
+  void SampleIkPose(float frame, DirectPoseIk outIk[2]) const {
+    const auto allIt = vmd->boneTimelines.find(
+        u8"\u5168\u3066\u306e\u89aa");
+    InterpResult allCurrent = {};
+    InterpResult allFirst = {};
+    allCurrent.rotation = allFirst.rotation = {0, 0, 0, 1};
+    if (allIt != vmd->boneTimelines.end()) {
+      allCurrent = InterpolateBone(allIt->second.keys, frame, true);
+      allFirst = InterpolateBone(allIt->second.keys, 0.0f, true);
+    }
+    Quat allRotation = SourceToRootRotation(allCurrent.rotation);
+    if (g_yawOffsetDeg != 0.0f) {
+      const float halfYaw = g_yawOffsetDeg * 0.00872664626f;
+      const Quat yaw = {0, sinf(halfYaw), 0, cosf(halfYaw)};
+      allRotation = QuatNormalize(QuatMul(yaw, allRotation));
+    }
+    allRotation = ScaleRotation(allRotation, PartScale(DIRECT_PART_ROOT));
+    const Vec3 allSourceDelta = Vec3Sub(allCurrent.position,
+                                        allFirst.position);
+    const float translationScale = positionScale * g_motionScale;
+    const Vec3 allOffset = Vec3Scale(
+        QuatRotate(rootBasis, VmdToUnityPosition(allSourceDelta)),
+        translationScale);
+
+    for (int side = 0; side < 2; ++side) {
+      const DirectIkBinding &chain = ikBindings[side];
+      DirectPoseIk &pose = outIk[side];
+      pose = {};
+      pose.allParentRotationRoot = allRotation;
+      pose.weight = (std::max)(0.0f, (std::min)(1.0f,
+          PartScale(DIRECT_PART_LEGS)));
+      if (!chain.footTimeline || !chain.legValid || pose.weight <= 0.0f)
+        continue;
+
+      const InterpResult footCurrent =
+          InterpolateBone(chain.footTimeline->keys, frame, true);
+      const InterpResult footFirst =
+          InterpolateBone(chain.footTimeline->keys, 0.0f, true);
+      const Vec3 footSourceDelta = Vec3Sub(footCurrent.position,
+                                           footFirst.position);
+      const Vec3 footOffset = Vec3Scale(
+          QuatRotate(rootBasis, VmdToUnityPosition(footSourceDelta)),
+          translationScale);
+      pose.allParentOffsetRoot = Vec3Add(
+          allOffset,
+          {g_posOffsetX, g_posOffsetY, g_posOffsetZ});
+      pose.footOffsetRoot = footOffset;
+      pose.legEnabled = SampleIkEnabled(chain.footTrackName, frame);
+
+      const Quat footRelative = QuatNormalize(QuatMul(
+          {footCurrent.rotation.x, footCurrent.rotation.y,
+           footCurrent.rotation.z, footCurrent.rotation.w},
+          QuatInv({footFirst.rotation.x, footFirst.rotation.y,
+                   footFirst.rotation.z, footFirst.rotation.w})));
+      pose.footRotationRoot = ScaleRotation(
+          SourceToRootRotation(footRelative), PartScale(DIRECT_PART_LEGS));
+
+      if (chain.toeTimeline && chain.toeValid) {
+        const InterpResult toeCurrent =
+            InterpolateBone(chain.toeTimeline->keys, frame, true);
+        const InterpResult toeFirst =
+            InterpolateBone(chain.toeTimeline->keys, 0.0f, true);
+        const Vec3 toeSourceDelta = Vec3Sub(toeCurrent.position,
+                                            toeFirst.position);
+        pose.toeOffsetRoot = Vec3Scale(
+            QuatRotate(rootBasis, VmdToUnityPosition(toeSourceDelta)),
+            translationScale);
+        pose.toeEnabled = SampleIkEnabled(chain.toeTrackName, frame);
+      }
+    }
   }
 
   void Sample(float timeSeconds, uint32_t generation, DirectPoseFrame &out) const {
@@ -526,6 +762,134 @@ struct DirectVmdMotion {
         pose.localPosition.z += targetDelta.z * scale + g_posOffsetZ;
       }
     }
+    SampleIkPose(out.frame, out.ik);
+  }
+
+  bool SetWorldRotationFromIk(void *transform, Quat worldRotation) const {
+    if (!transform)
+      return false;
+    void *parent = DirectGetParentTransform(transform);
+    Quat parentWorld = {0, 0, 0, 1};
+    if (parent && !ReadWorldRotation(parent, parentWorld))
+      return false;
+    const Quat local = QuatNormalize(
+        QuatMul(QuatInv(parentWorld), QuatNormalize(worldRotation)));
+    SafeSetLocalRotation(transform, local);
+    return true;
+  }
+
+  void ApplyLegIk(const DirectIkBinding &chain,
+                  const DirectPoseIk &pose) const {
+    if (!rootTransform || !chain.legValid || !pose.legEnabled ||
+        pose.weight <= 0.0f)
+      return;
+
+    Vec3 rootPosition, upperPosition, kneePosition, footPosition;
+    Quat rootWorld, upperWorld, lowerWorld;
+    if (!ReadWorldPosition(rootTransform, rootPosition) ||
+        !ReadWorldRotation(rootTransform, rootWorld) ||
+        !ReadWorldPosition(chain.upperLeg, upperPosition) ||
+        !ReadWorldPosition(chain.lowerLeg, kneePosition) ||
+        !ReadWorldPosition(chain.foot, footPosition) ||
+        !ReadWorldRotation(chain.upperLeg, upperWorld) ||
+        !ReadWorldRotation(chain.lowerLeg, lowerWorld))
+      return;
+
+    // VMD IK positions are model-controller coordinates. Without the source
+    // PMX rest positions, binding them to the target avatar's T-pose makes the
+    // first animated FK pose snap back to rest and spreads the thighs. Remove
+    // the sampled controller transform from the first actual FK result and use
+    // that as this avatar's controller base instead.
+    if (!chain.targetCalibrated) {
+      const Quat rootInverse = QuatInv(rootWorld);
+      const Vec3 currentFootRoot = QuatRotate(
+          rootInverse, Vec3Sub(footPosition, rootPosition));
+      chain.targetFootFromRoot = Vec3Sub(
+          QuatRotate(QuatInv(pose.allParentRotationRoot),
+                     Vec3Sub(currentFootRoot, pose.allParentOffsetRoot)),
+          pose.footOffsetRoot);
+      chain.targetToeFromFoot = chain.bindToeFromFoot;
+      if (chain.toeValid) {
+        Vec3 toePosition;
+        if (ReadWorldPosition(chain.toes, toePosition)) {
+          const Vec3 currentToeFromFootRoot = QuatRotate(
+              rootInverse, Vec3Sub(toePosition, footPosition));
+          const Quat toeParentRotation = QuatNormalize(QuatMul(
+              pose.allParentRotationRoot, pose.footRotationRoot));
+          chain.targetToeFromFoot = Vec3Sub(
+              QuatRotate(QuatInv(toeParentRotation),
+                         currentToeFromFootRoot),
+              pose.toeOffsetRoot);
+        }
+      }
+      chain.targetCalibrated = true;
+      Log("[VMD-DIRECT] Calibrated %s IK from first applied FK pose",
+          chain.footTrackName.c_str());
+      return;
+    }
+
+    const Vec3 footTargetRoot = Vec3Add(
+        pose.allParentOffsetRoot,
+        QuatRotate(pose.allParentRotationRoot,
+                   Vec3Add(chain.targetFootFromRoot,
+                           pose.footOffsetRoot)));
+    Vec3 footTarget = Vec3Add(
+        rootPosition, QuatRotate(rootWorld, footTargetRoot));
+    footTarget = Vec3Add(footPosition,
+        Vec3Scale(Vec3Sub(footTarget, footPosition), pose.weight));
+
+    Quat upperParentWorld = rootWorld;
+    void *upperParent = DirectGetParentTransform(chain.upperLeg);
+    if (upperParent)
+      ReadWorldRotation(upperParent, upperParentWorld);
+    const Vec3 poleWorld = QuatRotate(
+        upperParentWorld, chain.bindPoleFromUpperParent);
+    Vec3 desiredKnee;
+    if (!SolveTwoBoneKneePosition(upperPosition, footTarget,
+                                  chain.upperLength, chain.lowerLength,
+                                  poleWorld, desiredKnee))
+      return;
+
+    const Quat upperDelta = QuatFromTo(
+        Vec3Sub(kneePosition, upperPosition),
+        Vec3Sub(desiredKnee, upperPosition));
+    if (!SetWorldRotationFromIk(
+            chain.upperLeg, QuatMul(upperDelta, upperWorld)))
+      return;
+
+    if (!ReadWorldPosition(chain.lowerLeg, kneePosition) ||
+        !ReadWorldPosition(chain.foot, footPosition) ||
+        !ReadWorldRotation(chain.lowerLeg, lowerWorld))
+      return;
+    const Quat lowerDelta = QuatFromTo(
+        Vec3Sub(footPosition, kneePosition),
+        Vec3Sub(footTarget, kneePosition));
+    SetWorldRotationFromIk(chain.lowerLeg,
+                           QuatMul(lowerDelta, lowerWorld));
+
+    if (!pose.toeEnabled || !chain.toeValid)
+      return;
+    Vec3 toePosition;
+    Quat footWorld;
+    if (!ReadWorldPosition(chain.foot, footPosition) ||
+        !ReadWorldPosition(chain.toes, toePosition) ||
+        !ReadWorldRotation(chain.foot, footWorld))
+      return;
+    const Quat toeParentRotation = QuatNormalize(QuatMul(
+        pose.allParentRotationRoot, pose.footRotationRoot));
+    const Vec3 toeTargetRoot = Vec3Add(
+        footTargetRoot,
+        QuatRotate(toeParentRotation,
+                   Vec3Add(chain.targetToeFromFoot,
+                           pose.toeOffsetRoot)));
+    Vec3 toeTarget = Vec3Add(
+        rootPosition, QuatRotate(rootWorld, toeTargetRoot));
+    toeTarget = Vec3Add(toePosition,
+        Vec3Scale(Vec3Sub(toeTarget, toePosition), pose.weight));
+    const Quat footDelta = QuatFromTo(
+        Vec3Sub(toePosition, footPosition),
+        Vec3Sub(toeTarget, footPosition));
+    SetWorldRotationFromIk(chain.foot, QuatMul(footDelta, footWorld));
   }
 
   void Apply(const DirectPoseFrame &pose) const {
@@ -539,6 +903,8 @@ struct DirectVmdMotion {
       if (bone.hasPosition)
         SafeSetLocalPosition(bone.transform, bone.localPosition);
     }
+    for (int side = 0; side < 2; ++side)
+      ApplyLegIk(ikBindings[side], pose.ik[side]);
   }
 };
 
@@ -592,6 +958,7 @@ static void PublishDirectStats(const DirectVmdMotion *motion) {
                             std::memory_order_release);
   g_directCameraKeys.store((int)motion->vmd->cameraKeys.size(),
                           std::memory_order_release);
+  g_directIkTracks.store(motion->ikTracks, std::memory_order_release);
   g_directReady.store(true, std::memory_order_release);
   g_directLastError[0] = '\0';
 }

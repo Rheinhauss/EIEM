@@ -589,10 +589,16 @@ static void DrawMainPanel() {
       ImGui::Text(u8"\u5df2\u6620\u5c04: %d  \u672a\u6620\u5c04: %d",
                   g_directMappedBones.load(std::memory_order_acquire),
                   g_directUnmappedBones.load(std::memory_order_acquire));
+      const int ikTracks =
+          g_directIkTracks.load(std::memory_order_acquire);
+      if (ikTracks > 0)
+        ImGui::Text(u8"\u8db3/\u811a\u5c16 IK: %d \u8f68\u5df2\u6620\u5c04",
+                    ikTracks);
       const int unsupported =
           g_directUnsupportedBones.load(std::memory_order_acquire);
       if (unsupported > 0)
-        ImGui::TextDisabled(u8"\u672a\u652f\u6301 (IK): %d", unsupported);
+        ImGui::TextDisabled(u8"\u5176\u4ed6\u672a\u652f\u6301\u8f68\u9053: %d",
+                            unsupported);
     } else {
       ImGui::Text(u8"\u6a21\u5f0f: MUS4 Humanoid");
       ImGui::Text(u8"Muscles: %d", g_muscleAnim->muscleCount);

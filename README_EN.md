@@ -84,11 +84,11 @@ Auto-scans `game_dir/plugin/` or manually specify the following files:
 
 Direct mode supports common standard bones: parent, center, groove, lower/upper body, neck/head, shoulders/arms, arm and wrist twist, legs, feet, toes, eyes, jaw, and fingers. Translation is made relative to the first VMD frame, so playback starts from the character's current in-game position.
 
-The first version does not implement leg/foot IK, PMX model-specific local axes, append bones, or physics-bone semantics. Those and non-standard tracks are counted as unsupported and logged; the plugin deliberately avoids fuzzy bone-name matching that could produce a wrong pose. Use the MUS4 workflow for motions that depend on these features.
+Standard left/right foot and toe IK are solved on the game thread as Humanoid two-bone chains, and VMD IK enable/disable frames are honored. Because Direct mode does not load a PMX model, targets are calibrated from the VMD's first frame to the character's current feet. PMX-specific chain limits, model local axes, append bones, and physics-bone semantics remain unsupported. Non-standard tracks are counted and logged without fuzzy matching. Motions that rely on model-specific IK configuration or unusual proportions should still use MUS4.
 
 ## Motion Export (VMD → MUS4)
 
-MUS4 remains the higher-fidelity pre-baked option. Direct VMD mode does not require this section. Use the Unity workflow to produce `muscle_anim.bin` when a motion relies on MMD IK or model-specific axes, or when direct retargeting is not accurate enough.
+MUS4 remains the higher-fidelity pre-baked option. Direct VMD mode does not require this section. Use the Unity workflow to produce `muscle_anim.bin` when a motion relies on PMX-specific IK/local axes, or when direct retargeting is not accurate enough.
 
 ### Prerequisites
 

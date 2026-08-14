@@ -65,6 +65,12 @@ static void WriteCamera(FILE *file, uint32_t frame) {
   fwrite(&perspective, 1, 1, file);
 }
 
+static void WriteIkState(FILE *file, const char *sjisName, bool enabled) {
+  WriteFixed(file, sjisName, 20);
+  const uint8_t value = enabled ? 1 : 0;
+  fwrite(&value, 1, 1, file);
+}
+
 static std::string MakeFixture() {
   const char *path = "vmd_core_fixture.tmp";
   FILE *file = fopen(path, "wb");
@@ -94,6 +100,22 @@ static std::string MakeFixture() {
   const uint32_t cameraCount = 1;
   fwrite(&cameraCount, 4, 1, file);
   WriteCamera(file, 15);
+  const uint32_t lightCount = 0;
+  const uint32_t shadowCount = 0;
+  fwrite(&lightCount, 4, 1, file);
+  fwrite(&shadowCount, 4, 1, file);
+  const uint32_t modelCount = 1;
+  const uint32_t modelFrame = 12;
+  const uint8_t visible = 1;
+  const uint32_t ikCount = 2;
+  fwrite(&modelCount, 4, 1, file);
+  fwrite(&modelFrame, 4, 1, file);
+  fwrite(&visible, 1, 1, file);
+  fwrite(&ikCount, 4, 1, file);
+  WriteIkState(file, "\x8D\xB6\x91\xAB\x82\x68\x82\x6A", true);
+  WriteIkState(file,
+               "\x8D\xB6\x82\xC2\x82\xDC\x90\xE6\x82\x68\x82\x6A",
+               false);
   fclose(file);
   return path;
 }
@@ -127,6 +149,16 @@ static void TestParserAndSampling() {
   assert(vmd->cameraKeys[0].frame == 15);
   assert(Near(vmd->cameraKeys[0].position[2], 3.0f));
   assert(vmd->boneTimelines.size() == 2);
+  assert(vmd->modelKeys.size() == 1);
+  assert(vmd->ikTimelines.size() == 2);
+  auto footIk = vmd->ikTimelines.find(u8"\u5de6\u8db3\uff29\uff2b");
+  auto toeIk = vmd->ikTimelines.find(
+      u8"\u5de6\u3064\u307e\u5148\uff29\uff2b");
+  assert(footIk != vmd->ikTimelines.end());
+  assert(toeIk != vmd->ikTimelines.end());
+  assert(footIk->second.Sample(12.0f));
+  assert(!toeIk->second.Sample(12.0f));
+  assert(toeIk->second.Sample(11.0f)); // Enabled before its first property key.
 
   auto center = vmd->boneTimelines.find(u8"センター");
   assert(center != vmd->boneTimelines.end());
@@ -240,11 +272,51 @@ static void TestBezierAndRetargetMath() {
   const Quat actualUpperWorld = QuatNormalize(QuatMul(rootAll, compensation));
   const Quat expectedUpperWorld = QuatNormalize(QuatMul(common, upper));
   assert(fabsf(QuatDot(actualUpperWorld, expectedUpperWorld)) > 0.99999f);
+
+  const Quat turnForwardToRight = QuatFromTo({0, 0, 1}, {1, 0, 0});
+  const Vec3 turned = QuatRotate(turnForwardToRight, {0, 0, 1});
+  assert(Near(turned.x, 1.0f));
+  assert(Near(turned.z, 0.0f));
+
+  Vec3 knee;
+  assert(SolveTwoBoneKneePosition({0, 0, 0}, {0, -1.5f, 0},
+                                  1.0f, 1.0f, {0, 0, 1}, knee));
+  assert(Near(sqrtf(Vec3Dot(knee, knee)), 1.0f));
+  assert(Near(sqrtf(Vec3Dot(Vec3Sub({0, -1.5f, 0}, knee),
+                                    Vec3Sub({0, -1.5f, 0}, knee))),
+              1.0f));
+  assert(knee.z > 0.0f);
+}
+
+static void TestReferenceMotionIfPresent() {
+  const char *path = "JUMP UP_Light.vmd";
+  FILE *probe = fopen(path, "rb");
+  if (!probe)
+    return;
+  fclose(probe);
+  VmdFile *vmd = LoadVmd(path);
+  assert(vmd && vmd->loaded);
+  assert(vmd->boneTimelines.find(u8"\u5de6\u8db3\uff29\uff2b") !=
+         vmd->boneTimelines.end());
+  assert(vmd->boneTimelines.find(u8"\u53f3\u8db3\uff29\uff2b") !=
+         vmd->boneTimelines.end());
+  assert(vmd->boneTimelines.find(
+             u8"\u5de6\u3064\u307e\u5148\uff29\uff2b") !=
+         vmd->boneTimelines.end());
+  assert(vmd->boneTimelines.find(
+             u8"\u53f3\u3064\u307e\u5148\uff29\uff2b") !=
+         vmd->boneTimelines.end());
+  assert(vmd->ikTimelines.find(u8"\u5de6\u8db3\uff29\uff2b") !=
+         vmd->ikTimelines.end());
+  assert(vmd->ikTimelines.find(u8"\u53f3\u8db3\uff29\uff2b") !=
+         vmd->ikTimelines.end());
+  FreeVmd(vmd);
 }
 
 int main() {
   TestParserAndSampling();
   TestBezierAndRetargetMath();
+  TestReferenceMotionIfPresent();
   puts("vmd_core_tests: PASS");
   return 0;
 }

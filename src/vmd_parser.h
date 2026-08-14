@@ -65,6 +65,47 @@ struct VmdCameraKeyframe {
   uint8_t perspective = 0;
 };
 
+struct VmdLightKeyframe {
+  uint32_t frame = 0;
+  float color[3] = {};
+  float position[3] = {};
+};
+
+struct VmdShadowKeyframe {
+  uint32_t frame = 0;
+  uint8_t mode = 0;
+  float distance = 0.0f;
+};
+
+struct VmdIkKeyframe {
+  uint32_t frame = 0;
+  bool enabled = true;
+};
+
+struct VmdIkTimeline {
+  std::string ikName;
+  std::vector<VmdIkKeyframe> keys;
+
+  bool Sample(float frameF, bool defaultEnabled = true) const {
+    if (keys.empty() || frameF < (float)keys.front().frame)
+      return defaultEnabled;
+    size_t lo = 0, hi = keys.size();
+    while (lo + 1 < hi) {
+      const size_t mid = (lo + hi) / 2;
+      if ((float)keys[mid].frame <= frameF)
+        lo = mid;
+      else
+        hi = mid;
+    }
+    return keys[lo].enabled;
+  }
+};
+
+struct VmdModelKeyframe {
+  uint32_t frame = 0;
+  bool visible = true;
+};
+
 struct VmdFile {
   char signature[31] = {};
   char modelName[256] = {};
@@ -72,10 +113,17 @@ struct VmdFile {
   uint32_t boneFrames = 0;
   uint32_t morphFrames = 0;
   uint32_t cameraFrames = 0;
+  uint32_t lightFrames = 0;
+  uint32_t shadowFrames = 0;
+  uint32_t modelFrames = 0;
 
   std::map<std::string, VmdBoneTimeline> boneTimelines;
   std::map<std::string, VmdMorphTimeline> morphTimelines;
   std::vector<VmdCameraKeyframe> cameraKeys;
+  std::vector<VmdLightKeyframe> lightKeys;
+  std::vector<VmdShadowKeyframe> shadowKeys;
+  std::vector<VmdModelKeyframe> modelKeys;
+  std::map<std::string, VmdIkTimeline> ikTimelines;
 
   bool loaded = false;
   std::string error;
@@ -185,6 +233,9 @@ static VmdFile *LoadVmd(const char *path) {
   constexpr uint64_t kBoneRecordSize = 15 + 4 + 12 + 16 + 64;
   constexpr uint64_t kMorphRecordSize = 15 + 4 + 4;
   constexpr uint64_t kCameraRecordSize = 4 + 4 + 12 + 12 + 24 + 4 + 1;
+  constexpr uint64_t kLightRecordSize = 4 + 12 + 12;
+  constexpr uint64_t kShadowRecordSize = 4 + 1 + 4;
+  constexpr uint64_t kIkStateRecordSize = 20 + 1;
 
   uint32_t boneKeyCount = 0;
   if (!reader.ReadOne(boneKeyCount) || boneKeyCount > kMaxKeys ||
@@ -302,9 +353,128 @@ static VmdFile *LoadVmd(const char *path) {
     CompactVmdKeys(vmd->cameraKeys);
   }
 
+  // The remaining VMD 0002 sections are optional as a suffix. Parse them in
+  // order so model IK enable/disable keys can control the direct leg solver.
+  if (reader.offset < reader.size) {
+    uint32_t lightKeyCount = 0;
+    if (!reader.ReadOne(lightKeyCount) || lightKeyCount > kMaxKeys ||
+        !reader.CanReadRecords(lightKeyCount, kLightRecordSize)) {
+      vmd->error = "Invalid or truncated light keyframe section";
+      fclose(file);
+      return vmd;
+    }
+    vmd->lightKeys.reserve(lightKeyCount);
+    for (uint32_t i = 0; i < lightKeyCount; ++i) {
+      VmdLightKeyframe key;
+      if (!reader.ReadOne(key.frame) ||
+          !reader.Read(key.color, sizeof(key.color)) ||
+          !reader.Read(key.position, sizeof(key.position))) {
+        vmd->error = "Truncated light keyframe at index " + std::to_string(i);
+        fclose(file);
+        return vmd;
+      }
+      bool finite = true;
+      for (float value : key.color)
+        finite = finite && IsFiniteVmdFloat(value);
+      for (float value : key.position)
+        finite = finite && IsFiniteVmdFloat(value);
+      if (!finite) {
+        vmd->error = "Non-finite light keyframe at index " +
+                     std::to_string(i);
+        fclose(file);
+        return vmd;
+      }
+      vmd->lightKeys.push_back(key);
+      vmd->lightFrames = (std::max)(vmd->lightFrames, key.frame);
+    }
+    CompactVmdKeys(vmd->lightKeys);
+  }
+
+  if (reader.offset < reader.size) {
+    uint32_t shadowKeyCount = 0;
+    if (!reader.ReadOne(shadowKeyCount) || shadowKeyCount > kMaxKeys ||
+        !reader.CanReadRecords(shadowKeyCount, kShadowRecordSize)) {
+      vmd->error = "Invalid or truncated shadow keyframe section";
+      fclose(file);
+      return vmd;
+    }
+    vmd->shadowKeys.reserve(shadowKeyCount);
+    for (uint32_t i = 0; i < shadowKeyCount; ++i) {
+      VmdShadowKeyframe key;
+      if (!reader.ReadOne(key.frame) || !reader.ReadOne(key.mode) ||
+          !reader.ReadOne(key.distance)) {
+        vmd->error = "Truncated shadow keyframe at index " +
+                     std::to_string(i);
+        fclose(file);
+        return vmd;
+      }
+      if (!IsFiniteVmdFloat(key.distance)) {
+        vmd->error = "Non-finite shadow keyframe at index " +
+                     std::to_string(i);
+        fclose(file);
+        return vmd;
+      }
+      vmd->shadowKeys.push_back(key);
+      vmd->shadowFrames = (std::max)(vmd->shadowFrames, key.frame);
+    }
+    CompactVmdKeys(vmd->shadowKeys);
+  }
+
+  if (reader.offset < reader.size) {
+    uint32_t modelKeyCount = 0;
+    if (!reader.ReadOne(modelKeyCount) || modelKeyCount > kMaxKeys ||
+        !reader.CanReadRecords(modelKeyCount, 4 + 1 + 4)) {
+      vmd->error = "Invalid or truncated model/IK keyframe section";
+      fclose(file);
+      return vmd;
+    }
+    vmd->modelKeys.reserve(modelKeyCount);
+    for (uint32_t i = 0; i < modelKeyCount; ++i) {
+      VmdModelKeyframe modelKey;
+      uint8_t visible = 1;
+      uint32_t ikCount = 0;
+      if (!reader.ReadOne(modelKey.frame) || !reader.ReadOne(visible) ||
+          !reader.ReadOne(ikCount) || ikCount > kMaxKeys ||
+          !reader.CanReadRecords(ikCount, kIkStateRecordSize)) {
+        vmd->error = "Truncated model/IK keyframe at index " +
+                     std::to_string(i);
+        fclose(file);
+        return vmd;
+      }
+      modelKey.visible = visible != 0;
+      vmd->modelKeys.push_back(modelKey);
+      vmd->modelFrames = (std::max)(vmd->modelFrames, modelKey.frame);
+      for (uint32_t j = 0; j < ikCount; ++j) {
+        char name[20] = {};
+        uint8_t enabled = 1;
+        if (!reader.Read(name, sizeof(name)) || !reader.ReadOne(enabled)) {
+          vmd->error = "Truncated IK state at model keyframe " +
+                       std::to_string(i);
+          fclose(file);
+          return vmd;
+        }
+        const std::string utf8Name = SjisToUtf8(name, (int)sizeof(name));
+        auto &timeline = vmd->ikTimelines[utf8Name];
+        timeline.ikName = utf8Name;
+        timeline.keys.push_back({modelKey.frame, enabled != 0});
+      }
+    }
+    CompactVmdKeys(vmd->modelKeys);
+    for (auto &entry : vmd->ikTimelines)
+      CompactVmdKeys(entry.second.keys);
+  }
+
+  if (reader.offset != reader.size) {
+    vmd->error = "Unexpected trailing bytes after VMD 0002 sections";
+    fclose(file);
+    return vmd;
+  }
+
   fclose(file);
-  vmd->totalFrames = (std::max)(vmd->boneFrames,
-      (std::max)(vmd->morphFrames, vmd->cameraFrames));
+  vmd->totalFrames = (std::max)(
+      (std::max)(vmd->boneFrames, vmd->morphFrames),
+      (std::max)((std::max)(vmd->cameraFrames, vmd->lightFrames),
+                 (std::max)(vmd->shadowFrames, vmd->modelFrames)));
   vmd->loaded = true;
   return vmd;
 }
@@ -324,12 +494,17 @@ static void DumpVmd(const VmdFile *vmd, FILE *out) {
     fprintf(out, "Error: %s\n", vmd->error.c_str());
     return;
   }
-  fprintf(out, "Frames: total=%u bone=%u morph=%u camera=%u\n",
+  fprintf(out, "Frames: total=%u bone=%u morph=%u camera=%u light=%u shadow=%u model=%u\n",
           vmd->totalFrames, vmd->boneFrames, vmd->morphFrames,
-          vmd->cameraFrames);
+          vmd->cameraFrames, vmd->lightFrames, vmd->shadowFrames,
+          vmd->modelFrames);
   fprintf(out, "Bone timelines: %zu\n", vmd->boneTimelines.size());
   fprintf(out, "Morph timelines: %zu\n", vmd->morphTimelines.size());
   fprintf(out, "Camera keys: %zu\n\n", vmd->cameraKeys.size());
+  fprintf(out, "Light keys: %zu\n", vmd->lightKeys.size());
+  fprintf(out, "Shadow keys: %zu\n", vmd->shadowKeys.size());
+  fprintf(out, "Model keys: %zu, IK timelines: %zu\n\n",
+          vmd->modelKeys.size(), vmd->ikTimelines.size());
   for (const auto &entry : vmd->boneTimelines)
     fprintf(out, "  [BONE] %s: %zu keys\n", entry.first.c_str(),
             entry.second.keys.size());

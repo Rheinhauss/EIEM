@@ -6,8 +6,16 @@
 struct Vec3 { float x, y, z; };
 struct Quat { float x, y, z, w; };
 
+static Vec3 Vec3Add(Vec3 a, Vec3 b) {
+  return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
 static Vec3 Vec3Sub(Vec3 a, Vec3 b) {
   return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+static Vec3 Vec3Scale(Vec3 value, float scale) {
+  return {value.x * scale, value.y * scale, value.z * scale};
 }
 
 static float Vec3Dot(Vec3 a, Vec3 b) {
@@ -126,6 +134,62 @@ static Quat QuatSlerp(Quat a, Quat b, float t) {
     wa * a.z + wb * b.z,
     wa * a.w + wb * b.w
   };
+}
+
+// Smallest world-space rotation that points one direction at another. This
+// remains stable at 180 degrees, which is important for straight IK limbs.
+static Quat QuatFromTo(Vec3 from, Vec3 to) {
+  from = Vec3Normalize(from);
+  to = Vec3Normalize(to);
+  const float dot = (std::max)(-1.0f, (std::min)(1.0f, Vec3Dot(from, to)));
+  if (dot > 0.999999f)
+    return {0, 0, 0, 1};
+  if (dot < -0.999999f) {
+    Vec3 axis = fabsf(from.x) < 0.8f ? Vec3Cross(from, {1, 0, 0})
+                                    : Vec3Cross(from, {0, 1, 0});
+    axis = Vec3Normalize(axis);
+    return {axis.x, axis.y, axis.z, 0.0f};
+  }
+  const Vec3 axis = Vec3Cross(from, to);
+  return QuatNormalize({axis.x, axis.y, axis.z, 1.0f + dot});
+}
+
+// Analytic two-bone triangle. poleHint is a direction from the hip toward the
+// preferred side of the knee plane. The target may be unreachable; in that
+// case the triangle is clamped while retaining the requested direction.
+static bool SolveTwoBoneKneePosition(Vec3 hip, Vec3 target,
+                                     float upperLength, float lowerLength,
+                                     Vec3 poleHint, Vec3 &kneeOut) {
+  if (upperLength < 1e-5f || lowerLength < 1e-5f)
+    return false;
+  Vec3 towardTarget = Vec3Sub(target, hip);
+  const float rawDistance = sqrtf(Vec3Dot(towardTarget, towardTarget));
+  if (rawDistance < 1e-5f)
+    return false;
+  const Vec3 direction = Vec3Scale(towardTarget, 1.0f / rawDistance);
+  const float minDistance = fabsf(upperLength - lowerLength) + 1e-5f;
+  const float maxDistance = upperLength + lowerLength - 1e-5f;
+  const float distance = (std::max)(minDistance,
+      (std::min)(maxDistance, rawDistance));
+
+  Vec3 pole = Vec3Sub(poleHint,
+      Vec3Scale(direction, Vec3Dot(poleHint, direction)));
+  if (Vec3Dot(pole, pole) < 1e-8f) {
+    const Vec3 axis = fabsf(direction.y) < 0.8f ? Vec3{0, 1, 0}
+                                               : Vec3{0, 0, 1};
+    pole = Vec3Cross(direction, axis);
+  }
+  pole = Vec3Normalize(pole);
+
+  const float along = (upperLength * upperLength -
+                       lowerLength * lowerLength + distance * distance) /
+                      (2.0f * distance);
+  const float heightSquared =
+      (std::max)(0.0f, upperLength * upperLength - along * along);
+  const float height = sqrtf(heightSquared);
+  kneeOut = Vec3Add(hip, Vec3Add(Vec3Scale(direction, along),
+                                 Vec3Scale(pole, height)));
+  return true;
 }
 
 // Slerp without clamping t so the existing 0..2 motion-scale controls keep
