@@ -512,8 +512,6 @@ static void *__cdecl Hooked_Invoker(void *methodPtr, void *method, void *obj,
                                     void **params, void *retval) {
   return orig_Invoker(methodPtr, method, obj, params, retval);
 }
-
-
 typedef void(__cdecl *fn_SetHP_icall)(void *handler, void *bodyPos,
                                       void *bodyRot, void *muscles,
                                       void *methodInfo);
@@ -1555,7 +1553,8 @@ static bool EnsureAudioLoaded() {
 
 static void AudioStartFresh() {
   if (!EnsureAudioLoaded()) { g_audioIsClock = false; return; }
-  bool normalSpeed = !g_musclePlayer || fabsf(g_musclePlayer->speed - 1.0f) < 0.001f;
+  MmdPlayer *player = GetActiveMotionPlayer();
+  bool normalSpeed = !player || fabsf(player->speed - 1.0f) < 0.001f;
   if (!normalSpeed) { g_audioIsClock = false; return; }
 
   if (g_audioOffset < 0.0f) {
@@ -1574,10 +1573,147 @@ static void AudioStartFresh() {
       startMs, g_audioOffset, g_audioIsClock ? 1 : 0);
 }
 
+static void SyncAudioToMotion(MmdPlayer *player, float previousTime) {
+  if (!player)
+    return;
+  if (g_audioPendingStart && g_audioPlayer && g_audioPlayer->loaded) {
+    const float expectedAudio = player->currentTime + g_audioOffset;
+    if (expectedAudio >= 0.0f) {
+      g_audioPendingStart = false;
+      if (g_gameHwnd) {
+        const int motionMs = (int)(player->currentTime * 1000.0f);
+        PostMessageW(g_gameHwnd, WM_USER + 108, (WPARAM)motionMs, 0);
+      }
+    }
+  }
+  if (!g_audioIsClock || !g_audioPlayer || !g_audioPlayer->loaded)
+    return;
+  if (fabsf(player->speed - 1.0f) > 0.001f) {
+    g_audioPlayer->Pause();
+    g_audioIsClock = false;
+    return;
+  }
+  const int posMs = g_audioPlayer->GetPositionMs();
+  if (posMs > 0) {
+    const float audioSec = posMs / 1000.0f - g_audioOffset;
+    const float drift = audioSec - player->currentTime;
+    if (fabsf(drift) > 0.15f)
+      player->currentTime = audioSec;
+    else if (fabsf(drift) > 0.005f)
+      player->currentTime += drift * 0.1f;
+    if (player->currentTime < 0.0f)
+      player->currentTime = 0.0f;
+  }
+  if (player->loop && previousTime > 0.5f && player->currentTime < 0.1f) {
+    if (g_audioOffset < 0.0f) {
+      g_audioPendingStart = true;
+      g_audioIsClock = false;
+    } else if (g_gameHwnd) {
+      PostMessageW(g_gameHwnd, WM_USER + 108, (WPARAM)0, 0);
+    }
+  }
+}
+
+static bool ConfigureCameraSourceForPlayback() {
+  g_cameraPlayer.SetVmd(nullptr);
+  g_cameraNeedsCapture = false;
+  if (g_cameraVmd) {
+    FreeVmd(g_cameraVmd);
+    g_cameraVmd = nullptr;
+  }
+  if (!g_cameraEnabled)
+    return false;
+
+  // A separately selected camera VMD always wins. An empty, missing, invalid,
+  // or motion-only file falls through to camera keys embedded in the active
+  // direct-motion VMD.
+  if (g_cameraVmdPath[0] != '\0') {
+    VmdFile *candidate = LoadVmd(g_cameraVmdPath);
+    if (candidate && candidate->loaded && !candidate->cameraKeys.empty()) {
+      g_cameraVmd = candidate;
+      g_cameraPlayer.SetVmd(g_cameraVmd);
+      g_cameraNeedsCapture = true;
+      Log("[CAMERA] Using separate VMD: %s (%zu keys)", g_cameraVmdPath,
+          g_cameraVmd->cameraKeys.size());
+      return true;
+    }
+    if (candidate) {
+      if (candidate->loaded)
+        Log("[CAMERA] Separate VMD has no camera keys: %s", g_cameraVmdPath);
+      else
+        Log("[CAMERA] Separate VMD load failed: %s (%s)", g_cameraVmdPath,
+            candidate->error.c_str());
+      FreeVmd(candidate);
+    }
+  }
+
+  if (IsDirectVmdMode() && g_directMotion && g_directMotion->vmd &&
+      !g_directMotion->vmd->cameraKeys.empty()) {
+    g_cameraPlayer.SetVmd(g_directMotion->vmd);
+    g_cameraNeedsCapture = true;
+    Log("[CAMERA] Using camera track embedded in direct VMD (%zu keys)",
+        g_directMotion->vmd->cameraKeys.size());
+    return true;
+  }
+
+  Log("[CAMERA] No usable camera track");
+  return false;
+}
+
+static void ResetMotionFaceState() {
+  g_mouthWeightsFromMuscle = false;
+  memset(g_mouthWeights, 0, sizeof(g_mouthWeights));
+  memset(g_faceBoneTouched, 0, sizeof(g_faceBoneTouched));
+  for (int i = 0; i < NUM_EXTRA_MORPHS; ++i) {
+    g_extraMorphs[i].weight = 0.0f;
+    g_extraMorphs[i].prevWeight = 0.0f;
+  }
+  if (g_confirmedSMC && OFF_allMorphBoneDirty > 0) {
+    __try {
+      *(bool *)((char *)g_confirmedSMC + OFF_allMorphBoneDirty) = true;
+    } __except (1) {}
+  }
+}
+
+static void StopAllMotionPlayback(bool restoreCharacter = true) {
+  InvalidateDirectPlayback();
+  if (g_musclePlayer)
+    g_musclePlayer->Stop();
+  g_trojanActive = false;
+  g_mmdPendingApply = false;
+  g_mmdHasMuscles = false;
+  g_mmdHasArmBones = false;
+  g_mmdHasFingerBones = false;
+  ResetMotionFaceState();
+  CleanupPoseHandler();
+  RestoreBigList();
+  RestoreSkirtColliders();
+  RestoreDisabledComponents();
+  if (g_cameraActive)
+    RestoreCinemachine();
+  ResetCameraState();
+  if (g_audioPlayer)
+    g_audioPlayer->Stop();
+  g_audioIsClock = false;
+  g_audioPendingStart = false;
+  s_firstFrame = true;
+  if (restoreCharacter) {
+    SafeSetAnimatorEnabled(true);
+    if (g_cachedAnimator && g_animator_Rebind) {
+      __try { Invoke(g_animator_Rebind, g_cachedAnimator); } __except (1) {}
+    }
+  }
+}
+
 
 static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                    LPARAM lParam) {
   if (msg == WM_CLOSE || msg == WM_DESTROY) {
+    static bool s_exitRestored = false;
+    if (!s_exitRestored) {
+      s_exitRestored = true;
+      StopAllMotionPlayback();
+    }
     Log("[WNDPROC] Game window closing (msg=0x%X), signaling threads to exit",
         msg);
     g_guiRunning = false;
@@ -1585,6 +1721,10 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   }
 
   if (msg == WM_MMD_APPLY_POSE) {
+    if (!g_trojanActive || IsDirectVmdMode()) {
+      g_mmdPendingApply = false;
+      return 0;
+    }
     static bool s_firstLog = false;
     if (!s_firstLog) {
       Log("[WNDPROC] WM_MMD_APPLY_POSE received on main thread!");
@@ -1599,10 +1739,78 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     g_mmdPendingApply = false;
     return 0;
   }
-  if (msg >= (WM_USER + 100) && msg <= (WM_USER + 109)) {
+  if (msg == (WM_USER + 2)) {
+    ApplyPendingDirectPose((uint32_t)wParam);
+    return 0;
+  }
+  if (msg >= (WM_USER + 100) && msg <= (WM_USER + 116)) {
     switch (msg) {
     case (WM_USER + 100): 
       Log("[GUI-CMD] Play");
+      if (IsDirectVmdMode()) {
+        if (!g_directMotion || !g_directMotion->prepared ||
+            !g_directReady.load(std::memory_order_acquire)) {
+          Log("[VMD-DIRECT] Play failed: load a direct VMD first");
+          return 0;
+        }
+        if (!g_directPlayer)
+          g_directPlayer = new MmdPlayer();
+        bool directWasPlaying = false;
+        bool directResume = false;
+        AcquireSRWLockExclusive(&g_directClockLock);
+        g_directPlayer->speed = g_playbackSpeed;
+        g_directPlayer->loop = g_playbackLoop;
+        directWasPlaying = g_directPlayer->playing;
+        directResume = !g_directPlayer->playing &&
+                       g_directPlayer->currentTime > 0.0f &&
+                       g_directPlayer->currentTime <
+                           g_directMotion->Duration() - 0.001f;
+        if (directResume)
+          g_directPlayer->TogglePause();
+        ReleaseSRWLockExclusive(&g_directClockLock);
+        if (directResume) {
+          g_trojanActive = true;
+          g_directPlaying.store(true, std::memory_order_release);
+          if (g_audioIsClock && g_audioPlayer)
+            g_audioPlayer->Resume();
+        } else if (!directWasPlaying) {
+          RefreshEntityAnimator();
+          if (!g_cachedAnimator) {
+            Log("[VMD-DIRECT] Play failed: no active character Animator");
+            return 0;
+          }
+          PrepareDirectExternalComponents();
+          SafeSetAnimatorEnabled(false);
+          g_trojanActive = true;
+          if (g_morphVmdPath[0] != '\0' && !g_morphVmd) {
+            VmdFile *morph = LoadVmd(g_morphVmdPath);
+            if (morph && morph->loaded && !morph->morphTimelines.empty()) {
+              g_morphVmd = morph;
+              Log("[VMD-DIRECT] Explicit morph source loaded: %s",
+                  g_morphVmdPath);
+            } else {
+              Log("[VMD-DIRECT] Explicit morph source failed: %s",
+                  g_morphVmdPath);
+              if (morph) FreeVmd(morph);
+            }
+          }
+          const VmdFile *directMorphSource =
+              g_morphVmd ? g_morphVmd : g_directMotion->vmd;
+          Log("[VMD-DIRECT] Morph source: %s (%zu tracks)",
+              g_morphVmd ? "explicit VMD" : "direct motion VMD",
+              directMorphSource ? directMorphSource->morphTimelines.size() : 0);
+          ConfigureCameraSourceForPlayback();
+          AcquireSRWLockExclusive(&g_directClockLock);
+          g_directPlayer->Start(g_directMotion->Duration());
+          ReleaseSRWLockExclusive(&g_directClockLock);
+          g_directPlaying.store(true, std::memory_order_release);
+          AudioStartFresh();
+          Log("[VMD-DIRECT] Playing %.2f sec, mapped=%d unmapped=%d",
+              g_directMotion->Duration(), g_directMotion->mappedTracks,
+              g_directMotion->unmappedTracks);
+        }
+        return 0;
+      }
       if (!g_muscleAnim) g_muscleAnim = new MuscleAnim();
       if (!g_muscleAnim->loaded)
         g_muscleAnim->Load(g_muscleAnimPath);
@@ -1622,14 +1830,7 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             if (g_trojanHookTarget) MH_EnableHook(g_trojanHookTarget);
             g_trojanActive = true;
             g_musclePlayer->Start(g_muscleAnim->Duration());
-            if (g_cameraEnabled) {
-              if (!g_cameraVmd) g_cameraVmd = LoadVmd(g_cameraVmdPath);
-              if (g_cameraVmd && g_cameraVmd->loaded &&
-                  !g_cameraVmd->cameraKeys.empty()) {
-                g_cameraPlayer.SetVmd(g_cameraVmd);
-                g_cameraNeedsCapture = true;
-              }
-            }
+            ConfigureCameraSourceForPlayback();
             AudioStartFresh();
           }
         }
@@ -1637,48 +1838,34 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       return 0;
     case (WM_USER + 101): 
       Log("[GUI-CMD] Pause");
-      if (g_musclePlayer && g_musclePlayer->playing) {
+      if (IsDirectVmdMode()) {
+        bool paused = false;
+        AcquireSRWLockExclusive(&g_directClockLock);
+        if (g_directPlayer && g_directPlayer->playing) {
+          g_directPlayer->TogglePause();
+          paused = true;
+        }
+        ReleaseSRWLockExclusive(&g_directClockLock);
+        if (paused) {
+          g_directPlaying.store(false, std::memory_order_release);
+          if (g_audioIsClock && g_audioPlayer) g_audioPlayer->Pause();
+        }
+      } else if (g_musclePlayer && g_musclePlayer->playing) {
         g_musclePlayer->TogglePause();
         if (g_audioIsClock && g_audioPlayer) g_audioPlayer->Pause();
       }
       return 0;
     case (WM_USER + 102): 
       Log("[GUI-CMD] Stop");
-      if (g_musclePlayer &&
-          (g_musclePlayer->playing || g_musclePlayer->currentTime > 0)) {
-        if (g_musclePlayer->playing) g_musclePlayer->TogglePause();
-        g_musclePlayer->Stop();
-        g_trojanActive = false;
-        g_mouthWeightsFromMuscle = false;
-        memset(g_mouthWeights, 0, sizeof(g_mouthWeights));
-        CleanupPoseHandler();
-        RestoreBigList();
-        if (g_confirmedSMC && OFF_allMorphBoneDirty > 0) {
-          *(bool *)((char *)g_confirmedSMC + OFF_allMorphBoneDirty) = true;
-        }
-        memset(g_faceBoneTouched, 0, sizeof(g_faceBoneTouched));
-        for (int i = 0; i < NUM_EXTRA_MORPHS; i++) {
-          g_extraMorphs[i].weight = 0;
-          g_extraMorphs[i].prevWeight = 0;
-        }
-        RestoreDisabledComponents();
-        RestoreSkirtColliders();
-        SafeSetAnimatorEnabled(true);
-        if (g_cameraActive) {
-          RestoreCinemachine();
-        }
-        ResetCameraState();
-        s_firstFrame = true;
-        if (g_audioPlayer) g_audioPlayer->Stop();
-        g_audioIsClock = false;
-        g_audioPendingStart = false;
-      }
+      StopAllMotionPlayback();
       return 0;
     case (WM_USER + 103): 
       Log("[GUI-CMD] Load: %s", g_muscleAnimPath);
       if (!g_muscleAnim) g_muscleAnim = new MuscleAnim();
       g_muscleAnim->loaded = false;
       if (g_muscleAnim->Load(g_muscleAnimPath)) {
+        StopAllMotionPlayback();
+        g_motionSource.store(MOTION_SOURCE_MUSCLE, std::memory_order_release);
         Log("[GUI-CMD] Loaded: %d frames, %.1f sec",
             g_muscleAnim->frameCount, g_muscleAnim->Duration());
       } else {
@@ -1704,7 +1891,10 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       Log("[GUI-CMD] Seek audio: motion=%d ms, audio=%d ms (offset=%.2f)",
           motionMs, audioMs, g_audioOffset);
       if (g_audioPlayer && g_audioPlayer->loaded && g_audioEnabled) {
-        bool motionPlaying = g_musclePlayer && g_musclePlayer->playing;
+        MmdPlayer *player = GetActiveMotionPlayer();
+        bool motionPlaying = IsDirectVmdMode()
+            ? g_directPlaying.load(std::memory_order_acquire)
+            : (player && player->playing);
         g_audioPlayer->Stop();
         if (motionPlaying) {
           g_audioPlayer->PlayFrom(audioMs);
@@ -1724,25 +1914,150 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case (WM_USER + 105): 
       SafeInvokeCursorAction(g_cursorHideAction);
       return 0;
-    case (WM_USER + 106): 
-      Log("[GUI-CMD] Re-capture character");
-      if (g_musclePlayer &&
-          (g_musclePlayer->playing || g_musclePlayer->currentTime > 0)) {
-        g_musclePlayer->Stop();
-        g_trojanActive = false;
-        RestoreSkirtColliders();
-        RestoreDisabledComponents();
-        if (g_cameraActive) {
-          RestoreCinemachine();
-          g_cameraActive = false;
-          g_cameraNeedsCapture = false;
-        }
-        SafeSetAnimatorEnabled(true);
-        if (g_audioPlayer) g_audioPlayer->Stop();
-        g_audioIsClock = false;
-        g_audioPendingStart = false;
-        Log("[GUI-CMD] Stopped for character switch");
+    case (WM_USER + 110): {
+      Log("[GUI-CMD] Load direct VMD: %s", g_directVmdPath);
+      g_directLastError[0] = '\0';
+      VmdFile *probe = LoadVmd(g_directVmdPath);
+      if (!probe || !probe->loaded || probe->boneTimelines.empty()) {
+        const std::string error = probe
+            ? (probe->error.empty() ? "VMD contains no bone tracks" : probe->error)
+            : "VMD allocation failed";
+        strncpy(g_directLastError, error.c_str(), sizeof(g_directLastError) - 1);
+        if (probe) FreeVmd(probe);
+        Log("[VMD-DIRECT] Load failed: %s", g_directLastError);
+        return 0;
       }
+      FreeVmd(probe);
+
+      RefreshEntityAnimator();
+      DirectVmdMotion *candidate = CreateDirectVmdMotion(g_directVmdPath);
+      if (!candidate || !candidate->prepared) {
+        const std::string error = candidate ? candidate->error
+                                            : "Direct motion allocation failed";
+        strncpy(g_directLastError, error.c_str(), sizeof(g_directLastError) - 1);
+        delete candidate;
+        SafeSetAnimatorEnabled(true);
+        Log("[VMD-DIRECT] Prepare failed: %s", g_directLastError);
+        return 0;
+      }
+
+      // Only disturb the active player after parsing, mapping and bind capture
+      // all succeeded. A bad direct VMD therefore preserves the old action and
+      // selected mode.
+      StopAllMotionPlayback();
+      if (g_morphVmdPath[0] == '\0' && g_morphVmd) {
+        FreeVmd(g_morphVmd);
+        g_morphVmd = nullptr;
+        g_bsIndicesResolved = false;
+      }
+      ReplaceDirectMotion(candidate);
+      PublishDirectStats(g_directMotion);
+      g_motionSource.store(MOTION_SOURCE_DIRECT_VMD,
+                           std::memory_order_release);
+      if (!g_directPlayer)
+        g_directPlayer = new MmdPlayer();
+      g_directPlayer->speed = g_playbackSpeed;
+      g_directPlayer->loop = g_playbackLoop;
+      SafeSetAnimatorEnabled(true);
+      Log("[VMD-DIRECT] Ready: frames=%u mapped=%d unmapped=%d unsupported=%d",
+          g_directMotion->durationFrames, g_directMotion->mappedTracks,
+          g_directMotion->unmappedTracks, g_directMotion->unsupportedTracks);
+      return 0;
+    }
+    case (WM_USER + 111):
+      if (IsDirectVmdMode())
+        StopAllMotionPlayback();
+      g_motionSource.store(MOTION_SOURCE_MUSCLE, std::memory_order_release);
+      return 0;
+    case (WM_USER + 112): {
+      MmdPlayer *player = GetActiveMotionPlayer();
+      if (!player)
+        return 0;
+      if (IsDirectVmdMode())
+        AcquireSRWLockExclusive(&g_directClockLock);
+      player->currentTime = (float)(int)wParam / 1000.0f;
+      if (player->currentTime < 0.0f)
+        player->currentTime = 0.0f;
+      if (player->totalDuration > 0.0f &&
+          player->currentTime > player->totalDuration)
+        player->currentTime = player->totalDuration;
+      QueryPerformanceCounter(&player->lastTick);
+      if (IsDirectVmdMode())
+        ReleaseSRWLockExclusive(&g_directClockLock);
+      if (IsDirectVmdMode() && g_directMotion) {
+        const uint32_t generation =
+            g_directGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+        g_directPosePending.store(false, std::memory_order_release);
+        DirectPoseFrame pose;
+        g_directMotion->Sample(player->currentTime, generation, pose);
+        g_directMotion->Apply(pose);
+        SampleDirectMorphs(pose.frame);
+        UpdateDirectCameraTracking();
+        if (g_cameraActive)
+          ApplyCameraFrame(pose.timeSeconds);
+        g_directCurrentTime.store(player->currentTime,
+                                  std::memory_order_release);
+      }
+      return 0;
+    }
+    case (WM_USER + 113): {
+      MmdPlayer *player = GetActiveMotionPlayer();
+      if (player) {
+        if (IsDirectVmdMode())
+          AcquireSRWLockExclusive(&g_directClockLock);
+        player->speed = g_playbackSpeed;
+        player->loop = g_playbackLoop;
+        if (IsDirectVmdMode())
+          ReleaseSRWLockExclusive(&g_directClockLock);
+      }
+      return 0;
+    }
+    case (WM_USER + 114):
+      if (!g_directReady.load(std::memory_order_acquire)) {
+        strncpy(g_directLastError, "Load a direct VMD first",
+                sizeof(g_directLastError) - 1);
+        return 0;
+      }
+      if (!IsDirectVmdMode())
+        StopAllMotionPlayback();
+      g_motionSource.store(MOTION_SOURCE_DIRECT_VMD,
+                           std::memory_order_release);
+      return 0;
+    case (WM_USER + 115): {
+      if (g_morphVmdPath[0] == '\0') {
+        if (g_morphVmd) {
+          FreeVmd(g_morphVmd);
+          g_morphVmd = nullptr;
+        }
+        g_bsIndicesResolved = false;
+      } else {
+        VmdFile *candidate = LoadVmd(g_morphVmdPath);
+        if (candidate && candidate->loaded &&
+            !candidate->morphTimelines.empty()) {
+          if (g_morphVmd)
+            FreeVmd(g_morphVmd);
+          g_morphVmd = candidate;
+          g_bsIndicesResolved = true;
+          Log("[GUI-CMD] Morph VMD loaded: %s (%zu tracks)",
+              g_morphVmdPath, g_morphVmd->morphTimelines.size());
+        } else {
+          Log("[GUI-CMD] Morph VMD load failed; keeping previous source: %s",
+              g_morphVmdPath);
+          if (candidate) FreeVmd(candidate);
+        }
+      }
+      return 0;
+    }
+    case (WM_USER + 116):
+      StopAllMotionPlayback();
+      if (g_cameraVmd) {
+        FreeVmd(g_cameraVmd);
+        g_cameraVmd = nullptr;
+      }
+      return 0;
+    case (WM_USER + 106):
+      Log("[GUI-CMD] Re-capture character");
+      StopAllMotionPlayback();
       g_cachedAnimator = nullptr;
       s_poseReady = false;
       g_mmdHasMuscles = false;
@@ -1757,6 +2072,20 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       RefreshEntityAnimator();
       if (g_cachedAnimator) {
         Log("[GUI-CMD] New character captured: animator=%p", g_cachedAnimator);
+        if (IsDirectVmdMode() && g_directVmdPath[0]) {
+          DirectVmdMotion *candidate = CreateDirectVmdMotion(g_directVmdPath);
+          if (candidate && candidate->prepared) {
+            ReplaceDirectMotion(candidate);
+            PublishDirectStats(g_directMotion);
+          } else {
+            if (candidate) {
+              strncpy(g_directLastError, candidate->error.c_str(),
+                      sizeof(g_directLastError) - 1);
+              delete candidate;
+            }
+            g_directReady.store(false, std::memory_order_release);
+          }
+        }
       } else {
         Log("[GUI-CMD] No character found. Switch to a character first.");
       }
@@ -1786,54 +2115,9 @@ static void MuscleAnimationTick() {
     return;
 
   float prevTime = g_musclePlayer->currentTime;
-  float frameNum =
-      g_musclePlayer->Tick(); 
-
-  if (g_audioPendingStart && g_audioPlayer && g_audioPlayer->loaded) {
-    float expectedAudio = g_musclePlayer->currentTime + g_audioOffset;
-    if (expectedAudio >= 0.0f) {
-      g_audioPendingStart = false;
-      if (g_gameHwnd) {
-        int motionMs = (int)(g_musclePlayer->currentTime * 1000.0f);
-        PostMessageW(g_gameHwnd, WM_USER + 108, (WPARAM)motionMs, 0);
-        Log("[AUDIO] Deferred start: posting seek motion=%d ms", motionMs);
-      }
-    }
-  }
-
-  if (g_audioIsClock && g_audioPlayer && g_audioPlayer->loaded) {
-    if (fabsf(g_musclePlayer->speed - 1.0f) > 0.001f) {
-      g_audioPlayer->Pause();
-      g_audioIsClock = false;
-      Log("[AUDIO] Speed != 1.0, audio sync disabled");
-    } else {
-      int posMs = g_audioPlayer->GetPositionMs();
-      if (posMs > 0) { 
-        float audioSec = posMs / 1000.0f - g_audioOffset;
-        float drift = audioSec - g_musclePlayer->currentTime;
-
-        if (fabsf(drift) > 0.15f) {
-          g_musclePlayer->currentTime = audioSec;
-        } else if (fabsf(drift) > 0.005f) {
-          g_musclePlayer->currentTime += drift * 0.1f;
-        }
-        if (g_musclePlayer->currentTime < 0) g_musclePlayer->currentTime = 0;
-        frameNum = g_musclePlayer->currentTime * 30.0f;
-      }
-
-      if (g_musclePlayer->loop && prevTime > 0.5f &&
-          g_musclePlayer->currentTime < 0.1f) {
-        if (g_audioOffset < 0.0f) {
-          g_audioPendingStart = true;
-          g_audioIsClock = false;
-          Log("[AUDIO] Loop restart deferred (negative offset)");
-        } else if (g_gameHwnd) {
-          PostMessageW(g_gameHwnd, WM_USER + 108, (WPARAM)0, 0);
-          Log("[AUDIO] Loop restart posted");
-        }
-      }
-    }
-  }
+  g_musclePlayer->Tick();
+  SyncAudioToMotion(g_musclePlayer, prevTime);
+  float frameNum = g_musclePlayer->currentTime * g_muscleAnim->fps;
 
   float timeSec =
       frameNum / g_muscleAnim->fps; 
@@ -1854,13 +2138,13 @@ static void MuscleAnimationTick() {
   }
   g_mmdHasMuscles = true;
 
-  if (!g_vmd && !g_bsIndicesResolved) {
+  if (!g_morphVmd && !g_bsIndicesResolved) {
     g_bsIndicesResolved = true; 
 
     if (g_morphVmdPath[0] != '\0') {
       VmdFile *v = LoadVmd(g_morphVmdPath);
       if (v && v->loaded && !v->morphTimelines.empty()) {
-        g_vmd = v;
+        g_morphVmd = v;
         Log("[MOUTH] User morph VMD loaded: %s (%d morph timelines)",
             g_morphVmdPath, (int)v->morphTimelines.size());
       } else {
@@ -1900,7 +2184,7 @@ static void MuscleAnimationTick() {
         FindClose(hFind);
 
         if (bestVmd && bestMorphCount > 0) {
-          g_vmd = bestVmd;
+          g_morphVmd = bestVmd;
           Log("[MOUTH] Selected %s as morph source: %d morph timelines",
               bestName, bestMorphCount);
         } else if (bestVmd) {
@@ -1915,7 +2199,7 @@ static void MuscleAnimationTick() {
     }
   }
 
-  if (g_vmd && g_vmd->loaded && !g_vmd->morphTimelines.empty()) {
+  if (g_morphVmd && g_morphVmd->loaded && !g_morphVmd->morphTimelines.empty()) {
     static const char *morphNames[5] = {
         "\xe3\x81\x82", 
         "\xe3\x81\x84", 
@@ -1929,10 +2213,10 @@ static void MuscleAnimationTick() {
       s_morphMapped = true;
       static const char *labelNames[5] = {"A", "I", "U", "E", "O"};
       Log("[MOUTH] VMD morph timelines: %d total",
-          (int)g_vmd->morphTimelines.size());
+          (int)g_morphVmd->morphTimelines.size());
       for (int i = 0; i < 5; i++) {
-        auto it = g_vmd->morphTimelines.find(morphNames[i]);
-        if (it != g_vmd->morphTimelines.end()) {
+        auto it = g_morphVmd->morphTimelines.find(morphNames[i]);
+        if (it != g_morphVmd->morphTimelines.end()) {
           float peak = 0;
           for (auto &k : it->second.keys)
             if (k.weight > peak)
@@ -1944,7 +2228,7 @@ static void MuscleAnimationTick() {
         }
       }
 
-      for (auto &pair : g_vmd->morphTimelines) {
+      for (auto &pair : g_morphVmd->morphTimelines) {
         float peak = 0;
         float firstW = pair.second.keys.empty() ? 0 : pair.second.keys.front().weight;
         for (auto &k : pair.second.keys)
@@ -1960,8 +2244,8 @@ static void MuscleAnimationTick() {
 
     for (int i = 0; i < 5; i++) {
       float target = 0.0f;
-      auto it = g_vmd->morphTimelines.find(morphNames[i]);
-      if (it != g_vmd->morphTimelines.end()) {
+      auto it = g_morphVmd->morphTimelines.find(morphNames[i]);
+      if (it != g_morphVmd->morphTimelines.end()) {
         target = it->second.Sample(frameNum);
       }
       float smoothed = s_prevMouthWeights[i] +
@@ -1974,8 +2258,8 @@ static void MuscleAnimationTick() {
     static float s_extraAlpha = 0.25f;
     for (int em = 0; em < NUM_EXTRA_MORPHS; em++) {
       float target = 0.0f;
-      auto it = g_vmd->morphTimelines.find(g_extraMorphs[em].vmdNameUtf8);
-      if (it != g_vmd->morphTimelines.end()) {
+      auto it = g_morphVmd->morphTimelines.find(g_extraMorphs[em].vmdNameUtf8);
+      if (it != g_morphVmd->morphTimelines.end()) {
         target = it->second.Sample(frameNum);
       }
       float smoothed = g_extraMorphs[em].prevWeight +
@@ -1998,107 +2282,3 @@ static void MuscleAnimationTick() {
     s_logged = true;
   }
 }
-
-static void AnimationTick() {
-  if (g_calibMode) {
-    SafeSetAnimatorEnabled(false); 
-    CalibrationTick();
-    return;
-  }
-  if (!g_player || !g_player->playing)
-    return;
-  if (!g_vmd || !g_vmd->loaded)
-    return;
-  if (!g_resolvedMappings || g_resolvedMappings->empty())
-    return;
-
-  SafeSetAnimatorEnabled(false);
-
-  float frame = g_player->Tick();
-
-  FILE *dumpF = nullptr;
-  if (!s_dumpedFrame0 && frame < 1.0f) {
-    s_dumpedFrame0 = true;
-    dumpF = fopen("plugin\\eiem_frame0.txt", "w");
-    if (dumpF)
-      fprintf(dumpF, "=== VMD Frame 0 Dump ===\n\n");
-  }
-
-  for (auto &rm : *g_resolvedMappings) {
-    if (!rm.valid || !rm.transform)
-      continue;
-    CaptureBindPose(rm);
-    auto it = g_vmd->boneTimelines.find(rm.mmdName);
-    if (it == g_vmd->boneTimelines.end())
-      continue;
-    InterpResult interp =
-        InterpolateBone(it->second.keys, frame, rm.isPositionBone);
-
-    Quat raw = interp.rotation;
-    Quat R_bip = rm.hasBind ? Quat{rm.bindRot[0], rm.bindRot[1], rm.bindRot[2],
-                                   rm.bindRot[3]}
-                            : Quat{0, 0, 0, 1};
-    Quat R_mmd = GetMmdRestRot(rm.humanBone);
-
-    Quat result;
-    int mode = g_corrMode % g_corrCount;
-    switch (mode) {
-    case 0: {
-      result = QuatMul(QuatMul(R_bip, QuatInv(R_mmd)), raw);
-    } break;
-    case 1: {
-      Quat vmd_flipped = {raw.x, raw.y, -raw.z, -raw.w};
-      result = QuatMul(QuatMul(R_bip, QuatInv(R_mmd)), vmd_flipped);
-    } break;
-    case 2: {
-      Quat vmd_flipped = {-raw.x, -raw.y, raw.z, raw.w};
-      result = QuatMul(QuatMul(R_bip, QuatInv(R_mmd)), vmd_flipped);
-    } break;
-    case 3: {
-      result = QuatMul(raw, QuatMul(R_bip, QuatInv(R_mmd)));
-    } break;
-    case 4: {
-      result = QuatMul(QuatMul(QuatInv(R_mmd), R_bip), raw);
-    } break;
-    case 5: {
-      static const Quat G = {0.5f, -0.5f, 0.5f, 0.5f};
-      static const Quat Ginv = {-0.5f, 0.5f, -0.5f, 0.5f};
-      Quat sim_raw = QuatMul(QuatMul(G, raw), Ginv);
-      result = QuatMul(QuatMul(R_bip, QuatInv(R_mmd)), sim_raw);
-    } break;
-    case 6: {
-      static const Quat G = {0.5f, -0.5f, 0.5f, 0.5f};
-      static const Quat Ginv = {-0.5f, 0.5f, -0.5f, 0.5f};
-      result = QuatMul(R_bip, QuatMul(QuatMul(G, raw), Ginv));
-    } break;
-    case 7: {
-      result = R_bip;
-    } break;
-    default:
-      result = QuatMul(QuatMul(R_bip, QuatInv(R_mmd)), raw);
-      break;
-    }
-    SafeSetLocalRotation(rm.transform, result);
-
-    if (interp.hasPosition) {
-      Vec3 vmdPos = MmdPosToUnity(interp.position);
-      Vec3 fp = {rm.bindPos[0] + vmdPos.x, rm.bindPos[1] + vmdPos.y,
-                 rm.bindPos[2] + vmdPos.z};
-      SafeSetLocalPosition(rm.transform, fp);
-    }
-    if (dumpF) {
-      fprintf(dumpF,
-              "%-20s hb=%2d  vmd(%7.4f,%7.4f,%7.4f,%7.4f)  "
-              "R_bip(%7.4f,%7.4f,%7.4f,%7.4f)  R_mmd(%7.4f,%7.4f,%7.4f,%7.4f)  "
-              "out(%7.4f,%7.4f,%7.4f,%7.4f)  mode=%d\n",
-              rm.mmdName.c_str(), rm.humanBone, raw.x, raw.y, raw.z, raw.w,
-              R_bip.x, R_bip.y, R_bip.z, R_bip.w, R_mmd.x, R_mmd.y, R_mmd.z,
-              R_mmd.w, result.x, result.y, result.z, result.w, mode);
-    }
-  }
-  if (dumpF) {
-    fclose(dumpF);
-    dumpF = nullptr;
-  }
-}
-

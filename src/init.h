@@ -1,124 +1,5 @@
 #pragma once
 
-static void LoadAndResolveVmd(HWND hwnd) {
-  char filePath[MAX_PATH] = {0};
-  OPENFILENAMEA ofn = {};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = hwnd;
-  ofn.lpstrFilter = "VMD Files (*.vmd)\0*.vmd\0All Files\0*.*\0";
-  ofn.lpstrFile = filePath;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-  ofn.lpstrTitle = "EIEM - Select VMD File";
-
-  if (!GetOpenFileNameA(&ofn)) {
-    Log("[VMD] File dialog cancelled");
-    return;
-  }
-
-  Log("[VMD] Loading: %s", filePath);
-
-  if (g_vmd) {
-    FreeVmd(g_vmd);
-    g_vmd = nullptr;
-  }
-  if (!g_resolvedMappings)
-    g_resolvedMappings = new std::vector<ResolvedBoneMapping>();
-  g_resolvedMappings->clear();
-
-  g_vmd = LoadVmd(filePath);
-  if (!g_vmd->loaded) {
-    Log("[VMD] ERROR: %s", g_vmd->error.c_str());
-    return;
-  }
-
-  Log("[VMD] Loaded OK: model=%s, frames=%u (%.1f sec), %zu bone timelines",
-      g_vmd->modelName, g_vmd->totalFrames, g_vmd->totalFrames / 30.0f,
-      g_vmd->boneTimelines.size());
-
-  FILE *dumpFile = fopen("plugin/eiem_vmd_dump.txt", "w");
-  if (dumpFile) {
-    DumpVmd(g_vmd, dumpFile);
-
-    fprintf(dumpFile, "\n=== Bone Mapping Resolution ===\n");
-    RefreshEntityAnimator();
-
-    void *charRootTransform = nullptr;
-    if (g_cachedAnimator && g_component_get_transform) {
-      charRootTransform = SafeGetComponentTransform(g_cachedAnimator);
-    }
-    if (charRootTransform) {
-      Log("[VMD] Character root Transform: %p", charRootTransform);
-    } else {
-      Log("[VMD] WARNING: No character root Transform, finger bones won't "
-          "resolve");
-    }
-    int mapped = 0, unmapped = 0;
-    for (const auto &pair : g_vmd->boneTimelines) {
-      const std::string &mmdName = pair.first;
-      int humanBone = LookupBoneMapping(mmdName);
-      bool isPos = IsBonePositionMapped(mmdName);
-
-      ResolvedBoneMapping rm;
-      rm.mmdName = mmdName;
-      rm.humanBone = humanBone;
-      rm.isPositionBone = isPos;
-      rm.transform = nullptr;
-      rm.valid = false;
-
-      if (humanBone >= 0 && g_cachedAnimator && g_animator_GetBoneTransform) {
-        void *t = SafeGetBoneTransform(humanBone);
-        if (t) {
-          rm.transform = t;
-          rm.valid = true;
-        }
-      }
-
-      if (!rm.valid) {
-        const char *fingerName = LookupFingerMapping(mmdName);
-        if (fingerName && charRootTransform) {
-          void *t = SafeFindChildRecursive(charRootTransform, fingerName, 15);
-          if (t) {
-            rm.transform = t;
-            rm.transformName = fingerName;
-            rm.isFingerBone = true;
-            rm.valid = true;
-          }
-        }
-      }
-
-      if (rm.valid) {
-        char bname[256] = {0};
-        if (g_object_get_name)
-          SafeGetBoneName(rm.transform, bname, sizeof(bname));
-        fprintf(dumpFile, "  [OK] \"%s\" -> %s[%s] -> \"%s\" (%zu keys)%s\n",
-                mmdName.c_str(), rm.isFingerBone ? "Finger" : "HumanBone",
-                rm.isFingerBone ? rm.transformName.c_str()
-                                : std::to_string(humanBone).c_str(),
-                bname, pair.second.keys.size(), isPos ? " [POS]" : "");
-        mapped++;
-      } else if (humanBone >= 0 || LookupFingerMapping(mmdName)) {
-        fprintf(dumpFile,
-                "  [--] \"%s\" -> mapped but no Transform (%zu keys)\n",
-                mmdName.c_str(), pair.second.keys.size());
-        unmapped++;
-      } else {
-        fprintf(dumpFile, "  [??] \"%s\" -> NO MAPPING (%zu keys)\n",
-                mmdName.c_str(), pair.second.keys.size());
-        unmapped++;
-      }
-
-      g_resolvedMappings->push_back(rm);
-    }
-
-    fprintf(dumpFile, "\nMapped: %d, Unmapped: %d, Total: %d\n", mapped,
-            unmapped, mapped + unmapped);
-    fclose(dumpFile);
-
-    Log("[VMD] Bone mapping: %d mapped, %d unmapped. See eiem_vmd_dump.txt",
-        mapped, unmapped);
-  }
-}
 
 
 #include "camera_control.h"
@@ -163,14 +44,15 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
       insPressed = false;
     }
 
-    AnimationTick();
+    DirectAnimationTick();
     MuscleAnimationTick();
 
     if (g_camTestMode && g_cameraActive) {
       ApplyCameraFrame(0.0f);
     }
 
-    Sleep((g_musclePlayer && g_musclePlayer->playing) || g_camTestMode ? 0 : 50);
+    MmdPlayer *activePlayer = GetActiveMotionPlayer();
+    Sleep((activePlayer && activePlayer->playing) || g_camTestMode ? 0 : 50);
   }
 
   Log("[INFO] Game window closed, hotkey thread exiting");

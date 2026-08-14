@@ -204,10 +204,11 @@ static void RestoreCinemachine() {
 
 static Vec3 SampleCharDisplacement(float timeSec) {
   Vec3 disp = {0, 0, 0};
-  if (!g_vmd) return disp;
-  auto it = g_vmd->boneTimelines.find(
+  const VmdFile *motionVmd = GetActiveMotionVmd();
+  if (!motionVmd) return disp;
+  auto it = motionVmd->boneTimelines.find(
       "\xe3\x82\xbb\xe3\x83\xb3\xe3\x82\xbf\xe3\x83\xbc"); 
-  if (it != g_vmd->boneTimelines.end()) {
+  if (it != motionVmd->boneTimelines.end()) {
     float frameF = timeSec * 30.0f;
     InterpResult ir = InterpolateBone(it->second.keys, frameF, true);
     disp = ir.position;

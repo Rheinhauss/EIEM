@@ -24,6 +24,13 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 #define WM_MMD_GUI_LOAD_AUDIO (WM_USER + 107)
 #define WM_MMD_GUI_SEEK_AUDIO (WM_USER + 108) 
 #define WM_MMD_GUI_SET_VOLUME (WM_USER + 109) 
+#define WM_MMD_GUI_LOAD_VMD (WM_USER + 110)
+#define WM_MMD_GUI_SELECT_MUSCLE (WM_USER + 111)
+#define WM_MMD_GUI_SEEK_MOTION (WM_USER + 112)
+#define WM_MMD_GUI_PLAYBACK_OPTIONS (WM_USER + 113)
+#define WM_MMD_GUI_SELECT_DIRECT (WM_USER + 114)
+#define WM_MMD_GUI_LOAD_MORPH (WM_USER + 115)
+#define WM_MMD_GUI_CAMERA_CHANGED (WM_USER + 116)
 
 
 
@@ -442,15 +449,26 @@ static void DrawMainPanel() {
   int curFrame = 0;
   int totalFrames = 0;
   bool animLoaded = false;
+  const bool directVmdMode = IsDirectVmdMode();
+  MmdPlayer *activePlayer = GetActiveMotionPlayer();
 
-  if (g_muscleAnim && g_muscleAnim->loaded) {
+  if (directVmdMode && g_directReady.load(std::memory_order_acquire)) {
+    animLoaded = true;
+    totalFrames = (int)g_directTotalFrames.load(std::memory_order_acquire);
+    totalTime = totalFrames / 30.0f;
+  } else if (!directVmdMode && g_muscleAnim && g_muscleAnim->loaded) {
     animLoaded = true;
     totalTime = g_muscleAnim->Duration();
     totalFrames = g_muscleAnim->frameCount;
   }
-  if (g_musclePlayer) {
-    isPlaying = g_musclePlayer->playing;
-    curTime = g_musclePlayer->currentTime;
+  if (directVmdMode) {
+    isPlaying = g_directPlaying.load(std::memory_order_acquire);
+    curTime = g_directCurrentTime.load(std::memory_order_acquire);
+    curFrame = (int)(curTime * 30.0f);
+    isPaused = !isPlaying && curTime > 0.0f;
+  } else if (activePlayer) {
+    isPlaying = activePlayer->playing;
+    curTime = activePlayer->currentTime;
     curFrame = (int)(curTime * 30.0f);
     isPaused = !isPlaying && curTime > 0.0f;
   }
@@ -466,14 +484,14 @@ static void DrawMainPanel() {
   ImGui::Text(u8"\u65f6\u95f4: %.1f / %.1f \u79d2", curTime, totalTime);
   ImGui::Text(u8"\u5e27: %d / %d", curFrame, totalFrames);
 
-  if (totalTime > 0.0f && g_musclePlayer) {
+  if (totalTime > 0.0f && activePlayer) {
     float seekTime = curTime;
     ImGui::SetNextItemWidth(-1);
     static bool s_wasDragging = false;
     static float s_dragTarget = 0.0f;
     if (ImGui::SliderFloat("##seek", &seekTime, 0.0f, totalTime, u8"%.1f \u79d2")) {
-      g_musclePlayer->currentTime = seekTime;
-      QueryPerformanceCounter(&g_musclePlayer->lastTick);
+      PostMessageW(g_gameHwnd, WM_MMD_GUI_SEEK_MOTION,
+                   (WPARAM)(seekTime * 1000.0f), 0);
       s_wasDragging = true;
       s_dragTarget = seekTime;
     }
@@ -534,20 +552,19 @@ static void DrawMainPanel() {
 
   ImGui::Spacing();
 
-  if (g_musclePlayer) {
-    g_playbackSpeed = g_musclePlayer->speed;
-    g_playbackLoop  = g_musclePlayer->loop;
+  if (activePlayer && !directVmdMode) {
+    g_playbackSpeed = activePlayer->speed;
+    g_playbackLoop  = activePlayer->loop;
   }
   ImGui::SetNextItemWidth(140);
-  ImGui::SliderFloat(u8"\u64ad\u653e\u901f\u5ea6", &g_playbackSpeed, 0.1f, 3.0f, u8"%.1fx");
+  bool playbackOptionsChanged = ImGui::SliderFloat(
+      u8"\u64ad\u653e\u901f\u5ea6", &g_playbackSpeed, 0.1f, 3.0f, u8"%.1fx");
   ImGui::SameLine();
-  ImGui::Checkbox(u8"\u5faa\u73af", &g_playbackLoop);
+  playbackOptionsChanged |= ImGui::Checkbox(u8"\u5faa\u73af", &g_playbackLoop);
   ImGui::SameLine();
   ImGui::Checkbox(u8"\u955c\u5934", &g_cameraEnabled);
-  if (g_musclePlayer) {
-    g_musclePlayer->speed = g_playbackSpeed;
-    g_musclePlayer->loop  = g_playbackLoop;
-  }
+  if (activePlayer && playbackOptionsChanged)
+    PostMessageW(g_gameHwnd, WM_MMD_GUI_PLAYBACK_OPTIONS, 0, 0);
 
   ImGui::SetNextItemWidth(-1);
   ImGui::SliderFloat(u8"\u97f3\u9891\u504f\u79fb##offset", &g_audioOffset, -10.0f, 10.0f, u8"%.1f \u79d2");
@@ -567,13 +584,24 @@ static void DrawMainPanel() {
 
   ImGui::TextColored(ImVec4(0.20f, 0.20f, 0.24f, 1.0f), u8"\u52a8\u753b\u4fe1\u606f");
   if (animLoaded) {
-    ImGui::Text(u8"\u6587\u4ef6: muscle_anim.bin");
-    ImGui::Text(u8"Muscles: %d", g_muscleAnim->muscleCount);
-    ImGui::Text(u8"FPS: %.0f", g_muscleAnim->fps);
-    if (g_muscleAnim->hasFingerBones)
-      ImGui::Text(u8"\u624b\u6307\u9aa8\u9abc: %d", g_muscleAnim->fingerBoneCount);
-    else
-      ImGui::TextDisabled(u8"\u624b\u6307\u9aa8\u9abc: \u65e0");
+    if (directVmdMode) {
+      ImGui::Text(u8"\u6a21\u5f0f: VMD \u76f4\u63a5\u9aa8\u9abc\u9a71\u52a8");
+      ImGui::Text(u8"\u5df2\u6620\u5c04: %d  \u672a\u6620\u5c04: %d",
+                  g_directMappedBones.load(std::memory_order_acquire),
+                  g_directUnmappedBones.load(std::memory_order_acquire));
+      const int unsupported =
+          g_directUnsupportedBones.load(std::memory_order_acquire);
+      if (unsupported > 0)
+        ImGui::TextDisabled(u8"\u672a\u652f\u6301 (IK): %d", unsupported);
+    } else {
+      ImGui::Text(u8"\u6a21\u5f0f: MUS4 Humanoid");
+      ImGui::Text(u8"Muscles: %d", g_muscleAnim->muscleCount);
+      ImGui::Text(u8"FPS: %.0f", g_muscleAnim->fps);
+      if (g_muscleAnim->hasFingerBones)
+        ImGui::Text(u8"\u624b\u6307\u9aa8\u9abc: %d", g_muscleAnim->fingerBoneCount);
+      else
+        ImGui::TextDisabled(u8"\u624b\u6307\u9aa8\u9abc: \u65e0");
+    }
   } else {
     ImGui::TextDisabled(u8"\u672a\u52a0\u8f7d\u52a8\u753b");
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 14.0f);
@@ -630,6 +658,14 @@ static void DrawMainPanel() {
     ImGui::Spacing();
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 14.0f);
 
+    int selectedSource = IsDirectVmdMode() ? 1 : 0;
+    if (ImGui::RadioButton("MUS4 Humanoid", selectedSource == 0))
+      PostMessageW(g_gameHwnd, WM_MMD_GUI_SELECT_MUSCLE, 0, 0);
+    ImGui::SameLine();
+    if (ImGui::RadioButton(u8"VMD \u76f4\u63a5\u64ad\u653e", selectedSource == 1))
+      PostMessageW(g_gameHwnd, WM_MMD_GUI_SELECT_DIRECT, 0, 0);
+    ImGui::Spacing();
+
     ImGui::TextColored(ImVec4(0.20f, 0.20f, 0.24f, 1.0f), u8"\u52a8\u4f5c\u6587\u4ef6 (.bin)");
     ImGui::SetNextItemWidth(-1);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0f);
@@ -652,14 +688,6 @@ static void DrawMainPanel() {
         strncpy(g_muscleAnimPath, filePath, sizeof(g_muscleAnimPath) - 1);
         g_muscleAnimPath[sizeof(g_muscleAnimPath) - 1] = '\0';
         Log("[GUI] Anim selected: %s", g_muscleAnimPath);
-        if (g_muscleAnim) g_muscleAnim->loaded = false;
-        if (g_vmd) { g_vmd = nullptr; g_bsIndicesResolved = false; }
-        if (g_cameraActive) RestoreCinemachine();
-        ResetCameraState();
-        if (g_musclePlayer) {
-          g_musclePlayer->Stop();
-          g_musclePlayer->currentTime = 0;
-        }
       }
     } else { ImGui::PopStyleColor(); }
     ImGui::SameLine();
@@ -673,6 +701,64 @@ static void DrawMainPanel() {
       ImGui::TextColored(ImVec4(0.10f, 0.55f, 0.25f, 1.0f),
                          u8"%d \u5e27 / %.1f \u79d2",
                          g_muscleAnim->frameCount, g_muscleAnim->Duration());
+    } else {
+      ImGui::TextDisabled(u8"\u672a\u52a0\u8f7d");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextColored(ImVec4(0.20f, 0.20f, 0.24f, 1.0f),
+                       u8"\u76f4\u63a5 VMD \u52a8\u4f5c (.vmd)");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
+    ImGui::InputText("##directvmdpath", g_directVmdPath,
+                     sizeof(g_directVmdPath));
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
+    if (ImGui::Button(u8"\u6d4f\u89c8##directvmd", ImVec2(80, 0))) {
+      ImGui::PopStyleColor();
+      OPENFILENAMEA ofn = {};
+      char filePath[512] = "";
+      ofn.lStructSize = sizeof(ofn);
+      ofn.hwndOwner = g_guiHwnd;
+      ofn.lpstrFilter = "VMD Motion (*.vmd)\0*.vmd\0All Files\0*.*\0";
+      ofn.lpstrFile = filePath;
+      ofn.nMaxFile = sizeof(filePath);
+      ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+      if (GetOpenFileNameA(&ofn)) {
+        strncpy(g_directVmdPath, filePath, sizeof(g_directVmdPath) - 1);
+        g_directVmdPath[sizeof(g_directVmdPath) - 1] = '\0';
+        Log("[GUI] Direct VMD selected: %s", g_directVmdPath);
+      }
+    } else {
+      ImGui::PopStyleColor();
+    }
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
+    if (ImGui::Button(u8"\u52a0\u8f7d\u5e76\u5207\u6362##directvmd",
+                      ImVec2(-1, 0))) {
+      PostMessageW(g_gameHwnd, WM_MMD_GUI_LOAD_VMD, 0, 0);
+    }
+    ImGui::PopStyleColor();
+
+    if (g_directReady.load(std::memory_order_acquire)) {
+      const uint32_t frames =
+          g_directTotalFrames.load(std::memory_order_acquire);
+      ImGui::TextColored(
+          ImVec4(0.10f, 0.55f, 0.25f, 1.0f),
+          u8"%u \u5e27 / %.1f \u79d2 / %d \u8f68\u9053\u5df2\u6620\u5c04",
+          frames, frames / 30.0f,
+          g_directMappedBones.load(std::memory_order_acquire));
+    } else if (g_directLastError[0]) {
+      ImGui::TextColored(ImVec4(0.75f, 0.15f, 0.10f, 1.0f), "%s",
+                         g_directLastError);
     } else {
       ImGui::TextDisabled(u8"\u672a\u52a0\u8f7d");
     }
@@ -703,13 +789,7 @@ static void DrawMainPanel() {
         strncpy(g_cameraVmdPath, filePath, sizeof(g_cameraVmdPath) - 1);
         g_cameraVmdPath[sizeof(g_cameraVmdPath) - 1] = '\0';
         Log("[GUI] VMD selected: %s", g_cameraVmdPath);
-        g_cameraVmd = nullptr;
-        if (g_cameraActive) RestoreCinemachine();
-        ResetCameraState();
-        if (g_musclePlayer) {
-          g_musclePlayer->Stop();
-          g_musclePlayer->currentTime = 0;
-        }
+        PostMessageW(g_gameHwnd, WM_MMD_GUI_CAMERA_CHANGED, 0, 0);
       }
     } else { ImGui::PopStyleColor(); }
     ImGui::SameLine();
@@ -719,6 +799,12 @@ static void DrawMainPanel() {
       ImGui::TextColored(ImVec4(0.10f, 0.55f, 0.25f, 1.0f),
                          u8"%zu \u5173\u952e\u5e27",
                          g_cameraVmd->cameraKeys.size());
+    } else if (IsDirectVmdMode() &&
+               g_directCameraKeys.load(std::memory_order_acquire) > 0) {
+      ImGui::TextColored(
+          ImVec4(0.10f, 0.55f, 0.25f, 1.0f),
+          u8"%d \u5173\u952e\u5e27\uff08\u52a8\u4f5c VMD \u5185\u5d4c\uff09",
+          g_directCameraKeys.load(std::memory_order_acquire));
     } else {
       ImGui::TextDisabled(u8"\u672a\u52a0\u8f7d");
     }
@@ -749,20 +835,28 @@ static void DrawMainPanel() {
         strncpy(g_morphVmdPath, filePath, sizeof(g_morphVmdPath) - 1);
         g_morphVmdPath[sizeof(g_morphVmdPath) - 1] = '\0';
         Log("[GUI] Morph VMD selected: %s", g_morphVmdPath);
-        if (g_vmd) { g_vmd = nullptr; g_bsIndicesResolved = false; }
+        PostMessageW(g_gameHwnd, WM_MMD_GUI_LOAD_MORPH, 0, 0);
       }
     } else { ImGui::PopStyleColor(); }
     ImGui::SameLine();
     if (g_morphVmdPath[0] == '\0') {
-      ImGui::TextDisabled(u8"\u7a7a = \u81ea\u52a8\u626b\u63cf");
+      ImGui::TextDisabled(IsDirectVmdMode()
+                              ? u8"\u7a7a = \u52a8\u4f5c VMD \u8868\u60c5"
+                              : u8"\u7a7a = \u81ea\u52a8\u626b\u63cf");
     } else {
       ImGui::TextDisabled(u8"\u64ad\u653e\u65f6\u52a0\u8f7d");
     }
 
-    if (g_vmd && g_vmd->loaded && !g_vmd->morphTimelines.empty()) {
+    if (g_morphVmd && g_morphVmd->loaded && !g_morphVmd->morphTimelines.empty()) {
       ImGui::TextColored(ImVec4(0.10f, 0.55f, 0.25f, 1.0f),
                          u8"%d \u8868\u60c5\u8f68\u9053",
-                         (int)g_vmd->morphTimelines.size());
+                         (int)g_morphVmd->morphTimelines.size());
+    } else if (IsDirectVmdMode() &&
+               g_directMorphTracks.load(std::memory_order_acquire) > 0) {
+      ImGui::TextColored(
+          ImVec4(0.10f, 0.55f, 0.25f, 1.0f),
+          u8"%d \u8868\u60c5\u8f68\u9053\uff08\u52a8\u4f5c VMD\uff09",
+          g_directMorphTracks.load(std::memory_order_acquire));
     } else {
       ImGui::TextDisabled(u8"\u672a\u52a0\u8f7d");
     }

@@ -1,9 +1,31 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
 struct Vec3 { float x, y, z; };
 struct Quat { float x, y, z, w; };
+
+static Vec3 Vec3Sub(Vec3 a, Vec3 b) {
+  return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+static float Vec3Dot(Vec3 a, Vec3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static Vec3 Vec3Cross(Vec3 a, Vec3 b) {
+  return {a.y * b.z - a.z * b.y,
+          a.z * b.x - a.x * b.z,
+          a.x * b.y - a.y * b.x};
+}
+
+static Vec3 Vec3Normalize(Vec3 value) {
+  const float length = sqrtf(Vec3Dot(value, value));
+  if (length < 1e-6f)
+    return {0, 0, 0};
+  return {value.x / length, value.y / length, value.z / length};
+}
 
 static Quat QuatMul(Quat a, Quat b) {
   return {
@@ -18,10 +40,54 @@ static Quat QuatInv(Quat q) {
   return { -q.x, -q.y, -q.z, q.w };
 }
 
-static Vec3 Vec3Lerp(Vec3 a, Vec3 b, float t) {
-  return { a.x + (b.x - a.x) * t,
-           a.y + (b.y - a.y) * t,
-           a.z + (b.z - a.z) * t };
+static Quat QuatNormalize(Quat q) {
+  const float length = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  if (length < 1e-6f)
+    return {0, 0, 0, 1};
+  return {q.x / length, q.y / length, q.z / length, q.w / length};
+}
+
+static Vec3 QuatRotate(Quat rotation, Vec3 value) {
+  rotation = QuatNormalize(rotation);
+  const Quat vector = {value.x, value.y, value.z, 0.0f};
+  const Quat result = QuatMul(QuatMul(rotation, vector), QuatInv(rotation));
+  return {result.x, result.y, result.z};
+}
+
+// Build a quaternion whose local X/Y/Z axes point along right/up/forward.
+// The vectors are expected to be an orthonormal right-handed basis.
+static Quat QuatFromBasis(Vec3 right, Vec3 up, Vec3 forward) {
+  const float m00 = right.x,   m01 = up.x,   m02 = forward.x;
+  const float m10 = right.y,   m11 = up.y,   m12 = forward.y;
+  const float m20 = right.z,   m21 = up.z,   m22 = forward.z;
+  Quat result = {0, 0, 0, 1};
+  const float trace = m00 + m11 + m22;
+  if (trace > 0.0f) {
+    const float s = sqrtf(trace + 1.0f) * 2.0f;
+    result.w = 0.25f * s;
+    result.x = (m21 - m12) / s;
+    result.y = (m02 - m20) / s;
+    result.z = (m10 - m01) / s;
+  } else if (m00 > m11 && m00 > m22) {
+    const float s = sqrtf(1.0f + m00 - m11 - m22) * 2.0f;
+    result.w = (m21 - m12) / s;
+    result.x = 0.25f * s;
+    result.y = (m01 + m10) / s;
+    result.z = (m02 + m20) / s;
+  } else if (m11 > m22) {
+    const float s = sqrtf(1.0f + m11 - m00 - m22) * 2.0f;
+    result.w = (m02 - m20) / s;
+    result.x = (m01 + m10) / s;
+    result.y = 0.25f * s;
+    result.z = (m12 + m21) / s;
+  } else {
+    const float s = sqrtf(1.0f + m22 - m00 - m11) * 2.0f;
+    result.w = (m10 - m01) / s;
+    result.x = (m02 + m20) / s;
+    result.y = (m12 + m21) / s;
+    result.z = 0.25f * s;
+  }
+  return QuatNormalize(result);
 }
 
 static float QuatDot(Quat a, Quat b) {
@@ -29,6 +95,8 @@ static float QuatDot(Quat a, Quat b) {
 }
 
 static Quat QuatSlerp(Quat a, Quat b, float t) {
+  a = QuatNormalize(a);
+  b = QuatNormalize(b);
   float dot = QuatDot(a, b);
   if (dot < 0.0f) {
     b.x = -b.x; b.y = -b.y; b.z = -b.z; b.w = -b.w;
@@ -60,83 +128,61 @@ static Quat QuatSlerp(Quat a, Quat b, float t) {
   };
 }
 
+// Slerp without clamping t so the existing 0..2 motion-scale controls keep
+// their extrapolation behavior in direct-VMD mode.
+static Quat ScaleRotation(Quat delta, float scale) {
+  return QuatNormalize(QuatSlerp({0, 0, 0, 1}, delta, scale));
+}
 
-static Quat RotationTo(Vec3 from, Vec3 to) {
-  float fl = sqrtf(from.x*from.x + from.y*from.y + from.z*from.z);
-  float tl = sqrtf(to.x*to.x + to.y*to.y + to.z*to.z);
-  if (fl < 0.0001f || tl < 0.0001f) return {0,0,0,1};
-  from.x/=fl; from.y/=fl; from.z/=fl;
-  to.x/=tl; to.y/=tl; to.z/=tl;
-  
-  float dot = from.x*to.x + from.y*to.y + from.z*to.z;
-  if (dot > 0.9999f) return {0,0,0,1}; 
-  if (dot < -0.9999f) {
-    Vec3 perp = {1,0,0};
-    if (fabsf(from.x) > 0.9f) perp = {0,1,0};
-    Vec3 axis = {
-      from.y*perp.z - from.z*perp.y,
-      from.z*perp.x - from.x*perp.z,
-      from.x*perp.y - from.y*perp.x
-    };
-    float al = sqrtf(axis.x*axis.x + axis.y*axis.y + axis.z*axis.z);
-    if (al > 0.0001f) { axis.x/=al; axis.y/=al; axis.z/=al; }
-    return {axis.x, axis.y, axis.z, 0}; 
+// Compose collapsed MMD hierarchy layers from parent to child. Keeping this
+// operation explicit prevents container iteration order from changing poses.
+static Quat ComposeVmdRotation(Quat accumulated, Quat nextLayer) {
+  return QuatNormalize(QuatMul(accumulated, nextLayer));
+}
+
+// VMD/MMD body coordinates face the opposite X/Z directions from Unity's
+// canonical humanoid coordinates. This is a 180-degree basis rotation around
+// Y: positions (-x,y,-z), rotations (-x,y,-z,w).
+static Vec3 VmdToUnityPosition(Vec3 value) {
+  return {-value.x, value.y, -value.z};
+}
+
+static Quat VmdToUnityRotation(Quat value) {
+  return QuatNormalize({-value.x, value.y, -value.z, value.w});
+}
+
+static float VmdBezierAxis(float p1, float p2, float s) {
+  const float u = 1.0f - s;
+  return 3.0f * u * u * s * p1 + 3.0f * u * s * s * p2 + s * s * s;
+}
+
+static float VmdBezierEval(uint8_t x1Byte, uint8_t y1Byte,
+                           uint8_t x2Byte, uint8_t y2Byte, float t) {
+  if (t <= 0.0f)
+    return 0.0f;
+  if (t >= 1.0f)
+    return 1.0f;
+  const float x1 = (std::min)(x1Byte, (uint8_t)127) / 127.0f;
+  const float y1 = (std::min)(y1Byte, (uint8_t)127) / 127.0f;
+  const float x2 = (std::min)(x2Byte, (uint8_t)127) / 127.0f;
+  const float y2 = (std::min)(y2Byte, (uint8_t)127) / 127.0f;
+  if (fabsf(x1 - y1) < 1e-5f && fabsf(x2 - y2) < 1e-5f)
+    return t;
+
+  float lo = 0.0f, hi = 1.0f, s = t;
+  for (int i = 0; i < 16; ++i) {
+    const float x = VmdBezierAxis(x1, x2, s);
+    if (fabsf(x - t) < 1e-5f)
+      break;
+    if (x < t)
+      lo = s;
+    else
+      hi = s;
+    s = (lo + hi) * 0.5f;
   }
-  Vec3 c = {
-    from.y*to.z - from.z*to.y,
-    from.z*to.x - from.x*to.z,
-    from.x*to.y - from.y*to.x
-  };
-  float w = 1.0f + dot;
-  float len = sqrtf(c.x*c.x + c.y*c.y + c.z*c.z + w*w);
-  return {c.x/len, c.y/len, c.z/len, w/len};
+  return VmdBezierAxis(y1, y2, s);
 }
 
-static Quat RetargetRotation(Quat vmd, Quat fromStance, Quat toStance) {
-  return QuatMul(QuatMul(QuatInv(fromStance), vmd), toStance);
-}
-
-struct MmdStanceEntry {
-  const char* mmdName;
-  Vec3 defaultAxis;
-  Vec3 boneDir;
-};
-
-static const MmdStanceEntry g_mmdStanceTable[] = {
-  {"\xe5\xb7\xa6\xe8\x82\xa9",   {1,0,0}, { 0.9687f,-0.2480f, 0.0138f}},  
-  {"\xe5\xb7\xa6\xe8\x85\x95",   {1,0,0}, { 0.7941f,-0.6076f, 0.0120f}},  
-  {"\xe5\xb7\xa6\xe3\x81\xb2\xe3\x81\x98",{1,0,0}, { 0.7962f,-0.6047f,-0.0182f}},  
-  {"\xe5\xb7\xa6\xe6\x89\x8b\xe9\xa6\x96",{1,0,0}, { 0.7999f,-0.5972f,-0.0596f}},  
-  {"\xe5\x8f\xb3\xe8\x82\xa9",   {-1,0,0},{-0.9687f,-0.2480f, 0.0138f}},  
-  {"\xe5\x8f\xb3\xe8\x85\x95",   {-1,0,0},{-0.7941f,-0.6076f, 0.0120f}},  
-  {"\xe5\x8f\xb3\xe3\x81\xb2\xe3\x81\x98",{-1,0,0},{-0.7962f,-0.6047f,-0.0182f}},  
-  {"\xe5\x8f\xb3\xe6\x89\x8b\xe9\xa6\x96",{-1,0,0},{-0.7999f,-0.5972f,-0.0596f}},  
-  {"\xe4\xb8\x8a\xe5\x8d\x8a\xe8\xba\xab",      {0,1,0}, { 0.0000f, 0.9990f, 0.0440f}},  
-  {"\xe4\xb8\x8a\xe5\x8d\x8a\xe8\xba\xab\x32",   {0,1,0}, { 0.0000f, 0.9990f, 0.0440f}},  
-  {"\xe9\xa6\x96",               {0,1,0}, { 0.0000f, 1.0000f,-0.0099f}},  
-  {"\xe9\xa0\xad",               {0,1,0}, { 0.0000f, 1.0000f, 0.0000f}},  
-  {"\xe5\xb7\xa6\xe8\xb6\xb3",   {0,-1,0},{ 0.0151f,-0.9979f, 0.0637f}},  
-  {"\xe5\xb7\xa6\xe3\x81\xb2\xe3\x81\x96",{0,-1,0},{ 0.0073f,-0.9922f, 0.1247f}},  
-  {"\xe5\xb7\xa6\xe8\xb6\xb3\xe9\xa6\x96",{0,-1,0},{ 0.0000f,-1.0000f, 0.0000f}},  
-  {"\xe5\x8f\xb3\xe8\xb6\xb3",   {0,-1,0},{-0.0151f,-0.9979f, 0.0637f}},  
-  {"\xe5\x8f\xb3\xe3\x81\xb2\xe3\x81\x96",{0,-1,0},{-0.0073f,-0.9922f, 0.1247f}},  
-  {"\xe5\x8f\xb3\xe8\xb6\xb3\xe9\xa6\x96",{0,-1,0},{ 0.0000f,-1.0000f, 0.0000f}},  
-};
-static const int g_mmdStanceCount = sizeof(g_mmdStanceTable) / sizeof(g_mmdStanceTable[0]);
-
-static Quat LookupMmdStance(const std::string &mmdName) {
-  for (int i = 0; i < g_mmdStanceCount; i++) {
-    if (mmdName == g_mmdStanceTable[i].mmdName) {
-      return RotationTo(g_mmdStanceTable[i].defaultAxis, g_mmdStanceTable[i].boneDir);
-    }
-  }
-  return {0,0,0,1}; 
-}
-
-static Vec3 MmdPosToUnity(Vec3 p) {
-  float scale = 0.08f;
-  return { p.x * scale, p.y * scale, p.z * scale };
-}
 
 struct InterpResult {
   Vec3 position;
@@ -158,14 +204,14 @@ static InterpResult InterpolateBone(
 
   if (frame <= keys.front().frame) {
     const auto &k = keys.front();
-    result.rotation = { k.rot[0], k.rot[1], k.rot[2], k.rot[3] };
+    result.rotation = QuatNormalize({ k.rot[0], k.rot[1], k.rot[2], k.rot[3] });
     if (isPositionBone) result.position = { k.pos[0], k.pos[1], k.pos[2] };
     return result;
   }
 
   if (frame >= keys.back().frame) {
     const auto &k = keys.back();
-    result.rotation = { k.rot[0], k.rot[1], k.rot[2], k.rot[3] };
+    result.rotation = QuatNormalize({ k.rot[0], k.rot[1], k.rot[2], k.rot[3] });
     if (isPositionBone) result.position = { k.pos[0], k.pos[1], k.pos[2] };
     return result;
   }
@@ -188,12 +234,21 @@ static InterpResult InterpolateBone(
 
   Quat qa = { prev.rot[0], prev.rot[1], prev.rot[2], prev.rot[3] };
   Quat qb = { next.rot[0], next.rot[1], next.rot[2], next.rot[3] };
-  result.rotation = QuatSlerp(qa, qb, t);
+  // Bone curves are stored in the destination key. The first 16 bytes are a
+  // 4x4 matrix: X1 rows 0..3, Y1 rows 4..7, X2 rows 8..11, Y2 rows 12..15.
+  const uint8_t *ip = next.interp;
+  const float tx = VmdBezierEval(ip[0], ip[4], ip[8], ip[12], t);
+  const float ty = VmdBezierEval(ip[1], ip[5], ip[9], ip[13], t);
+  const float tz = VmdBezierEval(ip[2], ip[6], ip[10], ip[14], t);
+  const float tr = VmdBezierEval(ip[3], ip[7], ip[11], ip[15], t);
+  result.rotation = QuatNormalize(QuatSlerp(qa, qb, tr));
 
   if (isPositionBone) {
     Vec3 pa = { prev.pos[0], prev.pos[1], prev.pos[2] };
     Vec3 pb = { next.pos[0], next.pos[1], next.pos[2] };
-    result.position = Vec3Lerp(pa, pb, t);
+    result.position = {pa.x + (pb.x - pa.x) * tx,
+                       pa.y + (pb.y - pa.y) * ty,
+                       pa.z + (pb.z - pa.z) * tz};
   }
 
   return result;

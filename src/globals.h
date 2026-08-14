@@ -207,8 +207,27 @@ static void *g_object_get_name = nullptr;
 static HWND g_gameHwnd = nullptr;
 
 static char g_muscleAnimPath[512] = "plugin\\muscle_anim.bin";
+static char g_directVmdPath[512] = "";
 static char g_cameraVmdPath[512] = "plugin\\camera.vmd";
 static char g_morphVmdPath[512] = "";
+
+enum MotionSource {
+  MOTION_SOURCE_MUSCLE = 0,
+  MOTION_SOURCE_DIRECT_VMD = 1,
+};
+
+struct DirectVmdMotion;
+static DirectVmdMotion *g_directMotion = nullptr;
+static VmdFile *g_morphVmd = nullptr;
+static std::atomic<int> g_motionSource{MOTION_SOURCE_MUSCLE};
+static std::atomic<int> g_directMappedBones{0};
+static std::atomic<int> g_directUnmappedBones{0};
+static std::atomic<int> g_directUnsupportedBones{0};
+static std::atomic<uint32_t> g_directTotalFrames{0};
+static std::atomic<int> g_directMorphTracks{0};
+static std::atomic<int> g_directCameraKeys{0};
+static std::atomic<bool> g_directReady{false};
+static char g_directLastError[256] = {};
 
 struct AudioPlayer;
 static AudioPlayer *g_audioPlayer = nullptr;
@@ -220,6 +239,7 @@ static bool g_audioIsClock = false;
 static float g_audioOffset = 0.0f;
 static int g_audioVolume = 1000;
 static bool g_audioPendingStart = false;
+static void SyncAudioToMotion(MmdPlayer *player, float previousTime);
 
 static volatile bool g_guiVisible = false;
 static HWND g_guiHwnd = nullptr;

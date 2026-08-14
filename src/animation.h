@@ -65,9 +65,7 @@ static void *g_mainCharEntity = nullptr;
 static void *g_cachedAnimator =
     nullptr; 
 
-static VmdFile *g_vmd = nullptr;
-static std::vector<ResolvedBoneMapping> *g_resolvedMappings = nullptr;
-static MmdPlayer *g_player = nullptr;
+static MmdPlayer *g_directPlayer = nullptr;
 
 static void SafeRefreshEntity() {
   __try {
@@ -180,8 +178,8 @@ static void RestoreDisabledComponents() {
   if (!g_animator_set_enabled)
     return;
 
-  void *trueArg = (void *)1;
-  void **params = &trueArg;
+  bool trueValue = true;
+  void *params[] = {&trueValue};
 
   auto EnableComp = [&](void *comp, const char *name) {
     if (!comp)
@@ -209,7 +207,18 @@ static void RestoreDisabledComponents() {
     sprintf(name, "TransformFollowDamper #%d", i + 1);
     EnableComp(s_followDamper[i], name);
   }
+  for (int i = 0; i < s_lookAtCount; i++) {
+    char name[64];
+    sprintf(name, "LookAtComponent #%d", i + 1);
+    EnableComp(s_lookAt[i], name);
+  }
   EnableComp(s_animatorMono, "AnimatorMono");
+
+  if (g_confirmedSMC && s_eyeIKDisabled) {
+    __try {
+      *(bool *)((char *)g_confirmedSMC + 0x1dd) = true;
+    } __except (1) {}
+  }
 
   s_ikDisabled = false;
   memset(s_bipedIK, 0, sizeof(s_bipedIK));
@@ -219,6 +228,9 @@ static void RestoreDisabledComponents() {
   memset(s_followDamper, 0, sizeof(s_followDamper));
   s_followDamperCount = 0;
   s_animatorMono = nullptr;
+  memset(s_lookAt, 0, sizeof(s_lookAt));
+  s_lookAtCount = 0;
+  s_eyeIKDisabled = false;
 
   if (s_bbcCount > 0) {
     if (s_bbc_SetAnimPoseRatio) {
@@ -304,296 +316,6 @@ static bool ReadWorldPosition(void *transform, Vec3 &out) {
   return false;
 }
 
-static void ComputeStances(std::vector<ResolvedBoneMapping> &mappings) {
-  for (auto &rm : mappings) {
-    if (!rm.valid)
-      continue;
-    rm.mmdStance = LookupMmdStance(rm.mmdName);
-  }
-
-  if (!g_transform_get_position) {
-    Log("[WARN] get_position not available, using identity Endfield stances");
-    for (auto &rm : mappings) {
-      rm.endfieldStance = {0, 0, 0, 1};
-      rm.hasStance = true;
-    }
-    return;
-  }
-
-  static const struct {
-    const char *bone;
-    const char *child;
-  } boneChain[] = {
-      {"\xe5\xb7\xa6\xe8\x82\xa9",
-       "\xe5\xb7\xa6\xe8\x85\x95"}, 
-      {"\xe5\xb7\xa6\xe8\x85\x95",
-       "\xe5\xb7\xa6\xe3\x81\xb2\xe3\x81\x98"}, 
-      {"\xe5\xb7\xa6\xe3\x81\xb2\xe3\x81\x98",
-       "\xe5\xb7\xa6\xe6\x89\x8b\xe9\xa6\x96"}, 
-      {"\xe5\xb7\xa6\xe6\x89\x8b\xe9\xa6\x96",
-       nullptr}, 
-      {"\xe5\x8f\xb3\xe8\x82\xa9",
-       "\xe5\x8f\xb3\xe8\x85\x95"}, 
-      {"\xe5\x8f\xb3\xe8\x85\x95",
-       "\xe5\x8f\xb3\xe3\x81\xb2\xe3\x81\x98"}, 
-      {"\xe5\x8f\xb3\xe3\x81\xb2\xe3\x81\x98",
-       "\xe5\x8f\xb3\xe6\x89\x8b\xe9\xa6\x96"}, 
-      {"\xe5\x8f\xb3\xe6\x89\x8b\xe9\xa6\x96",
-       nullptr}, 
-      {"\xe4\xb8\x8a\xe5\x8d\x8a\xe8\xba\xab",
-       "\xe4\xb8\x8a\xe5\x8d\x8a\xe8\xba\xab\x32"}, 
-      {"\xe4\xb8\x8a\xe5\x8d\x8a\xe8\xba\xab\x32",
-       "\xe9\xa6\x96"},                 
-      {"\xe9\xa6\x96", "\xe9\xa0\xad"}, 
-      {"\xe9\xa0\xad", nullptr},        
-      {"\xe5\xb7\xa6\xe8\xb6\xb3",
-       "\xe5\xb7\xa6\xe3\x81\xb2\xe3\x81\x96"}, 
-      {"\xe5\xb7\xa6\xe3\x81\xb2\xe3\x81\x96",
-       "\xe5\xb7\xa6\xe8\xb6\xb3\xe9\xa6\x96"}, 
-      {"\xe5\xb7\xa6\xe8\xb6\xb3\xe9\xa6\x96", nullptr}, 
-      {"\xe5\x8f\xb3\xe8\xb6\xb3",
-       "\xe5\x8f\xb3\xe3\x81\xb2\xe3\x81\x96"}, 
-      {"\xe5\x8f\xb3\xe3\x81\xb2\xe3\x81\x96",
-       "\xe5\x8f\xb3\xe8\xb6\xb3\xe9\xa6\x96"}, 
-      {"\xe5\x8f\xb3\xe8\xb6\xb3\xe9\xa6\x96", nullptr}, 
-  };
-  static const int chainCount = sizeof(boneChain) / sizeof(boneChain[0]);
-
-  std::map<std::string, size_t> nameToIdx;
-  for (size_t i = 0; i < mappings.size(); i++) {
-    if (mappings[i].valid)
-      nameToIdx[mappings[i].mmdName] = i;
-  }
-
-  for (size_t i = 0; i < mappings.size(); i++) {
-    auto &rm = mappings[i];
-    if (!rm.valid || !rm.transform) {
-      rm.hasStance = true;
-      continue;
-    }
-
-    Vec3 defaultAxis = {0, 0, 0};
-    bool inTable = false;
-    for (int s = 0; s < g_mmdStanceCount; s++) {
-      if (rm.mmdName == g_mmdStanceTable[s].mmdName) {
-        defaultAxis = g_mmdStanceTable[s].defaultAxis;
-        inTable = true;
-        break;
-      }
-    }
-    if (!inTable) {
-      rm.endfieldStance = {0, 0, 0, 1};
-      rm.hasStance = true;
-      continue;
-    }
-
-    Vec3 thisPos;
-    if (!ReadWorldPosition(rm.transform, thisPos)) {
-      rm.endfieldStance = {0, 0, 0, 1};
-      rm.hasStance = true;
-      continue;
-    }
-
-    Vec3 childPos = thisPos;
-    bool foundChild = false;
-    for (int c = 0; c < chainCount; c++) {
-      if (rm.mmdName == boneChain[c].bone && boneChain[c].child != nullptr) {
-        auto it = nameToIdx.find(boneChain[c].child);
-        if (it != nameToIdx.end()) {
-          auto &childRm = mappings[it->second];
-          if (childRm.valid && childRm.transform &&
-              ReadWorldPosition(childRm.transform, childPos)) {
-            float dx = childPos.x - thisPos.x;
-            float dy = childPos.y - thisPos.y;
-            float dz = childPos.z - thisPos.z;
-            if (sqrtf(dx * dx + dy * dy + dz * dz) > 0.001f)
-              foundChild = true;
-          }
-        }
-        break;
-      }
-    }
-
-    if (foundChild) {
-      Vec3 dir = {childPos.x - thisPos.x, childPos.y - thisPos.y,
-                  childPos.z - thisPos.z};
-      rm.endfieldStance = RotationTo(defaultAxis, dir);
-      Log("[STANCE] %s: dir(%.3f,%.3f,%.3f) efS(%.4f,%.4f,%.4f,%.4f)",
-          rm.mmdName.c_str(), dir.x, dir.y, dir.z, rm.endfieldStance.x,
-          rm.endfieldStance.y, rm.endfieldStance.z, rm.endfieldStance.w);
-    } else {
-      rm.endfieldStance = {0, 0, 0, 1};
-    }
-    rm.hasStance = true;
-  }
-
-  Log("[STANCE] Computed stances for %d bones", (int)mappings.size());
-}
-
-static void CaptureBindPose(ResolvedBoneMapping &rm) {
-  if (rm.hasBind)
-    return;
-  __try {
-    if (g_transform_get_localRotation) {
-      void *boxed = Invoke(g_transform_get_localRotation, rm.transform);
-      if (boxed) {
-        float *data = (float *)((char *)boxed + 16);
-        rm.bindRot[0] = data[0];
-        rm.bindRot[1] = data[1];
-        rm.bindRot[2] = data[2];
-        rm.bindRot[3] = data[3];
-      }
-    }
-    if (g_transform_get_localPosition) {
-      void *boxed = Invoke(g_transform_get_localPosition, rm.transform);
-      if (boxed) {
-        float *data = (float *)((char *)boxed + 16);
-        rm.bindPos[0] = data[0];
-        rm.bindPos[1] = data[1];
-        rm.bindPos[2] = data[2];
-      }
-    }
-    rm.hasBind = true;
-  } __except (1) {
-  }
-}
-
-
-struct MmdRestRot {
-  int humanBone;
-  float r[4];
-};
-static const MmdRestRot g_mmdRest[] = {
-    {0, {0.054970f, -0.000550f, 0.009985f, 0.998438f}},    
-    {1, {-0.221591f, 0.253252f, -0.060742f, 0.939719f}},   
-    {2, {-0.193183f, -0.279992f, 0.066861f, 0.937984f}},   
-    {3, {0.391337f, 0.000000f, 0.000000f, 0.920247f}},     
-    {4, {0.352274f, 0.000000f, 0.000000f, 0.935897f}},     
-    {5, {-0.243333f, 0.027973f, 0.030674f, 0.969054f}},    
-    {6, {-0.250818f, -0.070884f, -0.077729f, 0.962301f}},  
-    {7, {-0.054961f, 0.001099f, 0.000000f, 0.998488f}},    
-    {8, {0.000000f, 0.000000f, 0.000000f, 1.000000f}},     
-    {9, {0.000000f, 0.000000f, 0.000000f, 1.000000f}},     
-    {10, {0.054966f, -0.000825f, 0.014977f, 0.998376f}},   
-    {11, {-0.005895f, 0.094641f, 0.009901f, 0.995445f}},   
-    {12, {-0.005895f, -0.094641f, -0.009901f, 0.995445f}}, 
-    {13, {-0.323522f, 0.433520f, 0.147442f, 0.828043f}},   
-    {14, {-0.326467f, -0.442077f, -0.120765f, 0.826682f}}, 
-    {15, {-0.591116f, 0.746363f, 0.000000f, 0.305818f}},   
-    {16, {0.591117f, 0.746363f, 0.000000f, -0.305818f}},   
-    {17, {0.260797f, 0.418563f, -0.479321f, 0.725976f}},   
-    {18, {0.221362f, -0.429079f, 0.463713f, 0.742873f}},   
-};
-static const int g_mmdRestCount = sizeof(g_mmdRest) / sizeof(g_mmdRest[0]);
-
-static Quat GetMmdRestRot(int hb) {
-  for (int i = 0; i < g_mmdRestCount; i++) {
-    if (g_mmdRest[i].humanBone == hb)
-      return {g_mmdRest[i].r[0], g_mmdRest[i].r[1], g_mmdRest[i].r[2],
-              g_mmdRest[i].r[3]};
-  }
-  return {0, 0, 0, 1}; 
-}
-
-
-static bool
-CaptureRestPoseViaRebind(std::vector<ResolvedBoneMapping> &mappings) {
-  if (!g_cachedAnimator || !g_animator_Rebind) {
-    Log("[BIND] Rebind not available, using hardcoded fallback");
-    return false;
-  }
-
-  SafeSetAnimatorEnabled(true);
-  Sleep(50);
-
-  __try {
-    Invoke(g_animator_Rebind, g_cachedAnimator);
-  } __except (1) {
-    Log("[BIND] Rebind crashed, using hardcoded fallback");
-    return false;
-  }
-
-  if (g_animator_Update) {
-    __try {
-      float dt = 0.0f;
-      void *params[] = {&dt};
-      Invoke(g_animator_Update, g_cachedAnimator, params);
-    } __except (1) {
-    }
-  }
-  Sleep(50);
-
-  SafeSetAnimatorEnabled(false);
-
-  Log("[BIND] Reading rest pose after Rebind...");
-  for (auto &rm : mappings) {
-    rm.hasBind = false;
-    CaptureBindPose(rm); 
-  }
-
-  for (auto &rm : mappings) {
-    if (rm.humanBone >= 0 && rm.humanBone <= 18) {
-      Log("  %-18s hb=%2d REST(%7.4f,%7.4f,%7.4f,%7.4f)", rm.mmdName.c_str(),
-          rm.humanBone, rm.bindRot[0], rm.bindRot[1], rm.bindRot[2],
-          rm.bindRot[3]);
-    }
-  }
-  return true;
-}
-
-static int g_corrMode = 0;
-static const int g_corrCount = 8;
-static const char *g_modeNames[] = {
-    "retarget",     "retarget-negZ", "retarget-negXY", "retarget-post",
-    "retarget-inv", "retarget+sim",  "sim+bind(old)",  "restPose"};
-static bool s_dumpedFrame0 = false;
-
-static bool g_calibMode = false;
-static int g_calibBone = 0;
-static int g_calibRot = 0;
-
-struct CalibRot {
-  Quat q;
-  const char *name;
-};
-static const CalibRot g_calibRots[] = {
-    {{0, 0, 0, 1}, "identity"},           {{0.3827f, 0, 0, 0.9239f}, "+45 X"},
-    {{-0.3827f, 0, 0, 0.9239f}, "-45 X"}, {{0, 0.3827f, 0, 0.9239f}, "+45 Y"},
-    {{0, -0.3827f, 0, 0.9239f}, "-45 Y"}, {{0, 0, 0.3827f, 0.9239f}, "+45 Z"},
-    {{0, 0, -0.3827f, 0.9239f}, "-45 Z"}, {{0.7071f, 0, 0, 0.7071f}, "+90 X"},
-    {{0, 0.7071f, 0, 0.7071f}, "+90 Y"},  {{0, 0, 0.7071f, 0.7071f}, "+90 Z"},
-};
-static const int g_calibRotCount = sizeof(g_calibRots) / sizeof(g_calibRots[0]);
-
-static void CalibrationTick() {
-  if (!g_resolvedMappings || g_resolvedMappings->empty())
-    return;
-  std::vector<int> validIdx;
-  for (int i = 0; i < (int)g_resolvedMappings->size(); i++) {
-    auto &rm = (*g_resolvedMappings)[i];
-    if (!rm.valid || !rm.transform || rm.isFingerBone)
-      continue;
-    validIdx.push_back(i);
-  }
-  if (validIdx.empty())
-    return;
-  int bi = g_calibBone % (int)validIdx.size();
-  int ri = g_calibRot % g_calibRotCount;
-  auto &rm = (*g_resolvedMappings)[validIdx[bi]];
-  CaptureBindPose(rm);
-  Quat bind = {rm.bindRot[0], rm.bindRot[1], rm.bindRot[2], rm.bindRot[3]};
-  Quat finalRot = QuatMul(bind, g_calibRots[ri].q);
-  SafeSetLocalRotation(rm.transform, finalRot);
-
-  static int lastBi = -1, lastRi = -1;
-  if (bi != lastBi || ri != lastRi) {
-    lastBi = bi;
-    lastRi = ri;
-    Log("[CALIB] Bone %d/%d '%s' (%s) | Rot %d: %s | bind(%.3f,%.3f,%.3f,%.3f)",
-        bi, (int)validIdx.size(), rm.mmdName.c_str(), rm.transformName.c_str(),
-        ri, g_calibRots[ri].name, bind.x, bind.y, bind.z, bind.w);
-  }
-}
 
 static MuscleAnim *g_muscleAnim = nullptr;
 static MmdPlayer *g_musclePlayer = nullptr;

@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <commdlg.h>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +41,7 @@ static bool UnboxBool(void *boxed) {
 }
 
 #include "animation.h"
+#include "direct_vmd_player.h"
 #include "trojan.h"
 #include "gui.h"
 #include "init.h"

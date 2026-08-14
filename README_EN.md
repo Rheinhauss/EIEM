@@ -2,7 +2,7 @@
 
 English | [中文](README.md)
 
-Brings MMD animation playback to *Arknights: Endfield*. Supports muscle-driven body motion, facial expressions, finger animation, camera motion, and synced background music, all controlled through an in-game GUI panel.
+Brings MMD animation playback to *Arknights: Endfield*. Motion can use pre-baked MUS4 data or be read directly from VMD; facial expressions, fingers, camera motion, and synced background music are controlled through the in-game GUI.
 
 example: [bilibili](https://www.bilibili.com/video/BV1YdEC6bEfP/)
 
@@ -30,14 +30,14 @@ example: [bilibili](https://www.bilibili.com/video/BV1YdEC6bEfP/)
 ## Features
 
 ### Implemented
-- **Muscle-driven motion**: Drives full-body animation via 95 muscle values
+- **MUS4 muscle playback**: Drives the body through 95 muscle values; this remains the default, higher-fidelity compatibility mode
+- **Direct VMD playback**: Samples standard VMD 0002 body, root-motion, finger, and morph tracks without a Unity conversion step
 - **Finger animation**: Independent rotation control for 30 finger bones
 - **Facial expressions**: Basic expressions including AIUEO, blinks, and smiling eyes
 - **Camera motion**: VMD camera keyframes (with character-facing alignment)
 - **Audio sync**: MCI backend plays WAV/MP3 BGM
 
 ### Planned
-- Direct VMD playback mode
 - Multi-character screen playback
 - ...
 
@@ -65,8 +65,8 @@ Auto-scans `game_dir/plugin/` or manually specify the following files:
 
 | File | Description | Required |
 |------|-------------|----------|
-| `muscle_anim.bin` | MUS4-format motion data (exported via ExportMuscleAnimation.cs) | **Yes** |
-| `*.vmd` | VMD file (facial expression morph data) | Optional (auto-scans .vmd in plugin dir) |
+| `muscle_anim.bin` | MUS4 motion data exported by `ExportMuscleAnimation.cs` | Required in MUS4 mode |
+| `*.vmd` | Direct-play motion, or a separate facial-morph override | Required in Direct VMD mode; morph override optional |
 | `camera.vmd` | Camera motion data | Optional |
 | `bgm.wav` or `bgm.mp3` | Background music | Optional |
 
@@ -74,11 +74,21 @@ Auto-scans `game_dir/plugin/` or manually specify the following files:
 
 1. Install as described above, launch the game, and enter the game.
 2. Press **Insert** to open the GUI panel.
-3. Load the desired files, then click the **Play** button on the "Control" tab to start playback.
+3. On the "Files" tab, select **MUS4** or **Direct VMD**:
+   - MUS4: load `muscle_anim.bin`. This remains the default mode.
+   - Direct VMD: choose a motion `.vmd` and click "Load and switch". A failed load preserves the current motion and mode.
+4. Optionally select a separate facial VMD, `camera.vmd`, and audio file. Direct mode uses the motion's own morph tracks unless a facial VMD is explicitly selected.
+5. Use the "Control" tab to play, pause, stop, seek, change speed, or loop. The panel reports duration, bone-track count, and mapped/unsupported counts.
+
+## Direct VMD Scope
+
+Direct mode supports common standard bones: parent, center, groove, lower/upper body, neck/head, shoulders/arms, arm and wrist twist, legs, feet, toes, eyes, jaw, and fingers. Translation is made relative to the first VMD frame, so playback starts from the character's current in-game position.
+
+The first version does not implement leg/foot IK, PMX model-specific local axes, append bones, or physics-bone semantics. Those and non-standard tracks are counted as unsupported and logged; the plugin deliberately avoids fuzzy bone-name matching that could produce a wrong pose. Use the MUS4 workflow for motions that depend on these features.
 
 ## Motion Export (VMD → MUS4)
 
-You must first convert VMD animations to MUS4 format (`muscle_anim.bin`) using the Unity editor.
+MUS4 remains the higher-fidelity pre-baked option. Direct VMD mode does not require this section. Use the Unity workflow to produce `muscle_anim.bin` when a motion relies on MMD IK or model-specific axes, or when direct retargeting is not accurate enough.
 
 ### Prerequisites
 
