@@ -31,13 +31,13 @@
 
 ### 已实装
 - **肌肉驱动动作**：通过 95 个 muscle 值，驱动全身动作
+- **VMD 直接播放**：无需 Unity 预转换，直接解析 VMD 骨骼、位移和表情轨道
 - **手指动画**：30 根手指骨骼的独立旋转控制
 - **面部表情**：AIUEO、眨眼、笑眼等基础表情
 - **相机运动**：VMD 相机关键帧（含角色朝向对齐）
 - **音频同步**：MCI 后端播放 WAV/MP3 BGM
 
 ### 已计划
-- VMD直接播放模式
 - 多角色同屏播放
 - ...
 
@@ -65,8 +65,8 @@ bin/d3dcompiler_47.dll   → 游戏目录/d3dcompiler_47.dll
 
 | 文件 | 说明 | 必要性 |
 |------|------|--------|
-| `muscle_anim.bin` | MUS4 格式动作数据（由ExportMuscleAnimation.cs导出） | **必须** |
-| `*.vmd` | VMD 文件（面部表情 morph 数据） | 可选（自动扫描 plugin 目录下的 .vmd） |
+| `muscle_anim.bin` | MUS4 格式动作数据（由ExportMuscleAnimation.cs导出） | 与直接 VMD 二选一 |
+| `*.vmd` | 可直接播放的 VMD 动作；MUS4 模式下也可提供表情数据 | 与 MUS4 二选一或可选 |
 | `camera.vmd` | 相机运动数据 | 可选 |
 | `bgm.wav` 或 `bgm.mp3` | 背景音乐 | 可选 |
 
@@ -74,11 +74,12 @@ bin/d3dcompiler_47.dll   → 游戏目录/d3dcompiler_47.dll
 
 1. 按上述方式安装后启动游戏，进入游戏。
 2. 按 **Insert** 键打开 GUI 面板。
-3. 加载指定文件后在「控制」页点击 **播放** 按钮开始播放动画。
+3. 在「文件」页加载 MUS4 动作，或选择“直接 VMD 动作”并点击“加载并切换”。
+4. 在「控制」页点击 **播放**；暂停、进度、循环、镜头与音频控制对两种模式通用。
 
-## 动作导出（VMD → MUS4）
+## 可选：动作导出（VMD → MUS4）
 
-需要先通过 Unity 编辑器将 VMD 动画转换为 MUS4 格式的 `muscle_anim.bin`。
+直接播放模式不需要转换。若希望使用 Humanoid muscle 重定向，可通过 Unity 编辑器将 VMD 动画转换为 MUS4 格式的 `muscle_anim.bin`。
 
 ### 前置条件
 

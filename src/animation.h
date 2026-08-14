@@ -67,7 +67,9 @@ static void *g_cachedAnimator =
 
 static VmdFile *g_vmd = nullptr;
 static std::vector<ResolvedBoneMapping> *g_resolvedMappings = nullptr;
+static SRWLOCK g_vmdLock = SRWLOCK_INIT;
 static MmdPlayer *g_player = nullptr;
+static bool LoadAndResolveVmdPath(const char *path);
 
 static void SafeRefreshEntity() {
   __try {
@@ -597,6 +599,18 @@ static void CalibrationTick() {
 
 static MuscleAnim *g_muscleAnim = nullptr;
 static MmdPlayer *g_musclePlayer = nullptr;
+
+static MmdPlayer *GetActiveMotionPlayer() {
+  return g_motionSource.load(std::memory_order_acquire) ==
+                 MOTION_SOURCE_DIRECT_VMD
+             ? g_player
+             : g_musclePlayer;
+}
+
+static bool IsDirectVmdMode() {
+  return g_motionSource.load(std::memory_order_acquire) ==
+         MOTION_SOURCE_DIRECT_VMD;
+}
 static uint32_t g_poseHandleGC = 0;
 static void *g_cachedMPtr = nullptr;
 static void *g_musclesArray = nullptr;
@@ -984,4 +998,3 @@ static void BoneAnimationTick() {
     s_logCount++;
   }
 }
-

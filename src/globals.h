@@ -161,6 +161,7 @@ static bool s_eyeIKDisabled = false;
 static void *s_cinemachineBrain = nullptr;  
 static VmdFile *g_cameraVmd = nullptr;      
 static CameraPlayer g_cameraPlayer;         
+static std::atomic<bool> g_cameraVmdReloadRequested{false};
 static bool g_cameraActive = false;         
 static bool g_cameraEnabled = true;         
 static float g_playbackSpeed = 1.0f;
@@ -262,8 +263,24 @@ static void *g_object_get_name = nullptr;
 static HWND g_gameHwnd = nullptr;
 
 static char g_muscleAnimPath[512] = "plugin\\muscle_anim.bin";
+static char g_directVmdPath[512] = "";
 static char g_cameraVmdPath[512] = "plugin\\camera.vmd";
 static char g_morphVmdPath[512] = "";
+
+enum MotionSource {
+  MOTION_SOURCE_MUSCLE = 0,
+  MOTION_SOURCE_DIRECT_VMD = 1,
+};
+static std::atomic<int> g_motionSource{MOTION_SOURCE_MUSCLE};
+static std::atomic<bool> g_directVmdReady{false};
+static std::atomic<int> g_directMappedBones{0};
+static std::atomic<int> g_directUnmappedBones{0};
+static std::atomic<uint32_t> g_directTotalFrames{0};
+static std::atomic<int> g_directBoneTracks{0};
+static std::atomic<int> g_directMorphTracks{0};
+static std::atomic<int> g_cameraKeyCount{0};
+static std::atomic<int> g_activeMorphTracks{0};
+static std::atomic<bool> g_morphVmdReloadRequested{false};
 
 struct AudioPlayer;
 static AudioPlayer *g_audioPlayer = nullptr;

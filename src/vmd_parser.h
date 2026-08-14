@@ -115,24 +115,35 @@ static VmdFile *LoadVmd(const char *path) {
   memcpy(vmd->signature, sigBuf, 30);
   vmd->signature[30] = '\0';
 
-  if (strncmp(sigBuf, "Vocaloid Motion Data 0002", 25) != 0 &&
-      strncmp(sigBuf, "Vocaloid Motion Data file", 25) != 0) {
+  const bool modernFormat =
+      strncmp(sigBuf, "Vocaloid Motion Data 0002", 25) == 0;
+  const bool legacyFormat =
+      strncmp(sigBuf, "Vocaloid Motion Data file", 25) == 0;
+  if (!modernFormat && !legacyFormat) {
     vmd->error = "Invalid VMD signature";
     fclose(f); return vmd;
   }
 
-  char modelBuf[20];
-  if (fread(modelBuf, 1, 20, f) != 20) {
+  char modelBuf[20] = {};
+  const int modelNameBytes = modernFormat ? 20 : 10;
+  if (fread(modelBuf, 1, modelNameBytes, f) !=
+      (size_t)modelNameBytes) {
     vmd->error = "File too small for model name";
     fclose(f); return vmd;
   }
-  std::string modelUtf8 = SjisToUtf8(modelBuf, 20);
+  std::string modelUtf8 = SjisToUtf8(modelBuf, modelNameBytes);
   strncpy(vmd->modelName, modelUtf8.c_str(), 20);
   vmd->modelName[20] = '\0';
 
   uint32_t boneKeyCount = 0;
   if (fread(&boneKeyCount, 4, 1, f) != 1) {
     vmd->error = "Cannot read bone keyframe count";
+    fclose(f); return vmd;
+  }
+  const long boneBytesRemaining = fileSize - ftell(f);
+  if (boneKeyCount > 10000000 || boneBytesRemaining < 0 ||
+      (uint64_t)boneKeyCount * 111ull > (uint64_t)boneBytesRemaining) {
+    vmd->error = "Invalid bone keyframe count";
     fclose(f); return vmd;
   }
 
@@ -179,6 +190,13 @@ static VmdFile *LoadVmd(const char *path) {
 
   uint32_t morphKeyCount = 0;
   if (fread(&morphKeyCount, 4, 1, f) == 1 && morphKeyCount > 0) {
+    const long morphBytesRemaining = fileSize - ftell(f);
+    if (morphKeyCount > 10000000 || morphBytesRemaining < 0 ||
+        (uint64_t)morphKeyCount * 23ull >
+            (uint64_t)morphBytesRemaining) {
+      vmd->error = "Invalid morph keyframe count";
+      fclose(f); return vmd;
+    }
     for (uint32_t i = 0; i < morphKeyCount; i++) {
       char nameBuf[15];
       uint32_t frame;
@@ -187,7 +205,9 @@ static VmdFile *LoadVmd(const char *path) {
       if (fread(nameBuf, 1, 15, f) != 15 ||
           fread(&frame, 4, 1, f) != 1 ||
           fread(&weight, 4, 1, f) != 1) {
-        break;
+        vmd->error =
+            "Truncated morph keyframe at index " + std::to_string(i);
+        fclose(f); return vmd;
       }
       
       VmdMorphKeyframe key;
@@ -213,8 +233,14 @@ static VmdFile *LoadVmd(const char *path) {
   }
 
   uint32_t cameraKeyCount = 0;
-  if (fread(&cameraKeyCount, 4, 1, f) == 1 && cameraKeyCount > 0 &&
-      cameraKeyCount < 1000000) {
+  if (fread(&cameraKeyCount, 4, 1, f) == 1 && cameraKeyCount > 0) {
+    const long cameraBytesRemaining = fileSize - ftell(f);
+    if (cameraKeyCount >= 1000000 || cameraBytesRemaining < 0 ||
+        (uint64_t)cameraKeyCount * 61ull >
+            (uint64_t)cameraBytesRemaining) {
+      vmd->error = "Invalid camera keyframe count";
+      fclose(f); return vmd;
+    }
     for (uint32_t i = 0; i < cameraKeyCount; i++) {
       uint32_t frame;
       float distance;
@@ -231,7 +257,9 @@ static VmdFile *LoadVmd(const char *path) {
           fread(interp, 1, 24, f) != 24 ||
           fread(&fov, 4, 1, f) != 1 ||
           fread(&perspective, 1, 1, f) != 1) {
-        break; 
+        vmd->error =
+            "Truncated camera keyframe at index " + std::to_string(i);
+        fclose(f); return vmd;
       }
 
       VmdCameraKeyframe key;

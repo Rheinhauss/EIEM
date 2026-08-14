@@ -1579,7 +1579,8 @@ static bool EnsureAudioLoaded() {
 
 static void AudioStartFresh() {
   if (!EnsureAudioLoaded()) { g_audioIsClock = false; return; }
-  bool normalSpeed = !g_musclePlayer || fabsf(g_musclePlayer->speed - 1.0f) < 0.001f;
+  MmdPlayer *player = GetActiveMotionPlayer();
+  bool normalSpeed = !player || fabsf(player->speed - 1.0f) < 0.001f;
   if (!normalSpeed) { g_audioIsClock = false; return; }
 
   if (g_audioOffset < 0.0f) {
@@ -1596,6 +1597,89 @@ static void AudioStartFresh() {
   g_audioPendingStart = false;
   Log("[AUDIO] Start fresh from %d ms (offset=%.2f), isClock=%d",
       startMs, g_audioOffset, g_audioIsClock ? 1 : 0);
+}
+
+static void PrepareCameraForMotion(const VmdFile *motionVmd) {
+  if (!g_cameraEnabled)
+    return;
+
+  if (g_cameraVmdReloadRequested.exchange(false,
+                                           std::memory_order_acq_rel)) {
+    if (g_cameraVmd)
+      FreeVmd(g_cameraVmd);
+    g_cameraVmd = nullptr;
+    g_cameraKeyCount.store(0, std::memory_order_release);
+  }
+
+  const VmdFile *cameraSource = nullptr;
+  if (motionVmd && !motionVmd->cameraKeys.empty()) {
+    cameraSource = motionVmd;
+    Log("[CAM] Using camera track embedded in the motion VMD");
+  } else {
+    if (!g_cameraVmd)
+      g_cameraVmd = LoadVmd(g_cameraVmdPath);
+    if (g_cameraVmd && g_cameraVmd->loaded &&
+        !g_cameraVmd->cameraKeys.empty()) {
+      cameraSource = g_cameraVmd;
+    }
+  }
+
+  if (cameraSource) {
+    g_cameraPlayer.SetVmd(cameraSource);
+    g_cameraKeyCount.store((int)cameraSource->cameraKeys.size(),
+                           std::memory_order_release);
+    g_cameraNeedsCapture = true;
+    Log("[CAM] Camera motion ready: %zu keys", cameraSource->cameraKeys.size());
+  } else {
+    g_cameraKeyCount.store(0, std::memory_order_release);
+    Log("[CAM] No usable camera track, character motion only");
+  }
+}
+
+static void ApplyVmdMorphFrame(const VmdFile *vmd, float frame);
+
+static void StopAllMotionPlayback() {
+  if (g_musclePlayer)
+    g_musclePlayer->Stop();
+
+  // Wait for a direct-VMD sample that is already in flight before restoring
+  // the character.  Once this exclusive lock is held, no sampler can write a
+  // final stale pose after the cleanup below.
+  AcquireSRWLockExclusive(&g_vmdLock);
+  if (g_player)
+    g_player->Stop();
+  if (g_resolvedMappings) {
+    for (auto &mapping : *g_resolvedMappings)
+      mapping.hasBind = false;
+  }
+  ReleaseSRWLockExclusive(&g_vmdLock);
+
+  g_trojanActive.store(false, std::memory_order_release);
+  g_mouthWeightsFromMuscle.store(false, std::memory_order_release);
+  ResetPublishedFaceWeights();
+  ApplyVmdMorphFrame(nullptr, 0.0f);
+  ResetMmdPoseSnapshot();
+  g_mmdPendingApply.store(false, std::memory_order_release);
+  CleanupPoseHandler();
+  RestoreBigList();
+  if (g_confirmedSMC && OFF_allMorphBoneDirty > 0)
+    *(bool *)((char *)g_confirmedSMC + OFF_allMorphBoneDirty) = true;
+  memset(g_faceBoneTouched, 0, sizeof(g_faceBoneTouched));
+
+  RestoreDisabledComponents();
+  RestoreSkirtColliders();
+  SafeSetAnimatorEnabled(true);
+  if (g_cameraActive)
+    RestoreCinemachine();
+  ResetCameraState();
+  g_cameraKeyCount.store(0, std::memory_order_release);
+
+  if (g_audioPlayer)
+    g_audioPlayer->Stop();
+  g_audioIsClock = false;
+  g_audioPendingStart = false;
+  s_firstFrame = true;
+  s_dumpedFrame0 = false;
 }
 
 
@@ -1623,86 +1707,130 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     g_mmdPendingApply.store(false, std::memory_order_release);
     return 0;
   }
-  if (msg >= (WM_USER + 100) && msg <= (WM_USER + 109)) {
+  if (msg >= (WM_USER + 100) && msg <= (WM_USER + 110)) {
     switch (msg) {
     case (WM_USER + 100): 
       Log("[GUI-CMD] Play");
-      if (!g_muscleAnim) g_muscleAnim = new MuscleAnim();
-      if (!g_muscleAnim->loaded)
-        g_muscleAnim->Load(g_muscleAnimPath);
-      if (g_muscleAnim->loaded) {
-        if (!g_musclePlayer) {
-          g_musclePlayer = new MmdPlayer();
-          g_musclePlayer->speed = g_playbackSpeed;
-          g_musclePlayer->loop  = g_playbackLoop;
+      if (IsDirectVmdMode()) {
+        if (!g_directVmdReady.load(std::memory_order_acquire) &&
+            g_directVmdPath[0]) {
+          LoadAndResolveVmdPath(g_directVmdPath);
         }
-        if (g_musclePlayer->playing) {
-        } else if (g_musclePlayer->currentTime > 0) {
-          g_musclePlayer->TogglePause(); 
-          if (g_audioIsClock && g_audioPlayer) g_audioPlayer->Resume();
-        } else {
+        if (!g_directVmdReady.load(std::memory_order_acquire) || !g_vmd ||
+            !g_vmd->loaded) {
+          Log("[VMD-DIRECT] Play failed: load a VMD motion first");
+          return 0;
+        }
+        if (!g_player)
+          g_player = new MmdPlayer();
+        g_player->speed = g_playbackSpeed;
+        g_player->loop = g_playbackLoop;
+        float duration = g_vmd->totalFrames / 30.0f;
+        if (duration <= 0.0f)
+          duration = 1.0f / 30.0f;
+        if (!g_player->playing && g_player->currentTime > 0.0f &&
+            g_player->currentTime < duration - 0.001f) {
+          g_player->TogglePause();
+          if (g_audioIsClock && g_audioPlayer)
+            g_audioPlayer->Resume();
+        } else if (!g_player->playing) {
           RefreshEntityAnimator();
-          if (InitMusclePoseHandler()) {
-            if (g_trojanHookTarget) MH_EnableHook(g_trojanHookTarget);
-            g_trojanActive = true;
-            g_musclePlayer->Start(g_muscleAnim->Duration());
-            if (g_cameraEnabled) {
-              if (!g_cameraVmd) g_cameraVmd = LoadVmd(g_cameraVmdPath);
-              if (g_cameraVmd && g_cameraVmd->loaded &&
-                  !g_cameraVmd->cameraKeys.empty()) {
-                g_cameraPlayer.SetVmd(g_cameraVmd);
-                g_cameraNeedsCapture = true;
-              }
+          if (!g_cachedAnimator) {
+            Log("[VMD-DIRECT] Play failed: no active character Animator");
+            return 0;
+          }
+          if (g_trojanHookTarget)
+            MH_DisableHook(g_trojanHookTarget);
+          ResetMmdPoseSnapshot();
+          AcquireSRWLockExclusive(&g_vmdLock);
+          for (auto &mapping : *g_resolvedMappings)
+            mapping.hasBind = false;
+          ReleaseSRWLockExclusive(&g_vmdLock);
+          g_trojanActive.store(true, std::memory_order_release);
+          PrepareCameraForMotion(g_vmd);
+          g_player->Start(duration);
+          AudioStartFresh();
+          Log("[VMD-DIRECT] Playing %.1f sec with %d mapped bones", duration,
+              g_directMappedBones.load(std::memory_order_acquire));
+        }
+      } else {
+        if (!g_muscleAnim)
+          g_muscleAnim = new MuscleAnim();
+        if (!g_muscleAnim->loaded)
+          g_muscleAnim->Load(g_muscleAnimPath);
+        if (g_muscleAnim->loaded) {
+          if (!g_musclePlayer)
+            g_musclePlayer = new MmdPlayer();
+          g_musclePlayer->speed = g_playbackSpeed;
+          g_musclePlayer->loop = g_playbackLoop;
+          const float duration = g_muscleAnim->Duration();
+          if (!g_musclePlayer->playing &&
+              g_musclePlayer->currentTime > 0 &&
+              g_musclePlayer->currentTime < duration - 0.001f) {
+            g_musclePlayer->TogglePause();
+            if (g_audioIsClock && g_audioPlayer)
+              g_audioPlayer->Resume();
+          } else if (!g_musclePlayer->playing) {
+            RefreshEntityAnimator();
+            if (InitMusclePoseHandler()) {
+              if (g_trojanHookTarget)
+                MH_EnableHook(g_trojanHookTarget);
+              g_trojanActive.store(true, std::memory_order_release);
+              g_musclePlayer->Start(duration);
+              PrepareCameraForMotion(nullptr);
+              AudioStartFresh();
             }
-            AudioStartFresh();
           }
         }
       }
       return 0;
     case (WM_USER + 101): 
       Log("[GUI-CMD] Pause");
-      if (g_musclePlayer && g_musclePlayer->playing) {
-        g_musclePlayer->TogglePause();
-        if (g_audioIsClock && g_audioPlayer) g_audioPlayer->Pause();
+      if (MmdPlayer *player = GetActiveMotionPlayer()) {
+        if (player->playing) {
+          player->TogglePause();
+          if (g_audioIsClock && g_audioPlayer)
+            g_audioPlayer->Pause();
+        }
       }
       return 0;
     case (WM_USER + 102): 
       Log("[GUI-CMD] Stop");
-      if (g_musclePlayer &&
-          (g_musclePlayer->playing || g_musclePlayer->currentTime > 0)) {
-        if (g_musclePlayer->playing) g_musclePlayer->TogglePause();
-        g_musclePlayer->Stop();
-        g_trojanActive = false;
-        g_mouthWeightsFromMuscle.store(false, std::memory_order_release);
-        ResetPublishedFaceWeights();
-        CleanupPoseHandler();
-        RestoreBigList();
-        if (g_confirmedSMC && OFF_allMorphBoneDirty > 0) {
-          *(bool *)((char *)g_confirmedSMC + OFF_allMorphBoneDirty) = true;
-        }
-        memset(g_faceBoneTouched, 0, sizeof(g_faceBoneTouched));
-        RestoreDisabledComponents();
-        RestoreSkirtColliders();
-        SafeSetAnimatorEnabled(true);
-        if (g_cameraActive) {
-          RestoreCinemachine();
-        }
-        ResetCameraState();
-        s_firstFrame = true;
-        if (g_audioPlayer) g_audioPlayer->Stop();
-        g_audioIsClock = false;
-        g_audioPendingStart = false;
-      }
+      StopAllMotionPlayback();
       return 0;
     case (WM_USER + 103): 
       Log("[GUI-CMD] Load: %s", g_muscleAnimPath);
       if (!g_muscleAnim) g_muscleAnim = new MuscleAnim();
       g_muscleAnim->loaded = false;
       if (g_muscleAnim->Load(g_muscleAnimPath)) {
+        StopAllMotionPlayback();
+        AcquireSRWLockExclusive(&g_vmdLock);
+        if (g_vmd) {
+          FreeVmd(g_vmd);
+          g_vmd = nullptr;
+        }
+        if (g_resolvedMappings)
+          g_resolvedMappings->clear();
+        ReleaseSRWLockExclusive(&g_vmdLock);
+        g_directVmdReady.store(false, std::memory_order_release);
+        g_directTotalFrames.store(0, std::memory_order_release);
+        g_directBoneTracks.store(0, std::memory_order_release);
+        g_directMorphTracks.store(0, std::memory_order_release);
+        g_activeMorphTracks.store(0, std::memory_order_release);
+        g_motionSource.store(MOTION_SOURCE_MUSCLE, std::memory_order_release);
+        g_bsIndicesResolved = false;
         Log("[GUI-CMD] Loaded: %d frames, %.1f sec",
             g_muscleAnim->frameCount, g_muscleAnim->Duration());
       } else {
         Log("[GUI-CMD] Load FAILED: %s", g_muscleAnimPath);
+      }
+      return 0;
+    case (WM_USER + 110):
+      StopAllMotionPlayback();
+      if (LoadAndResolveVmdPath(g_directVmdPath)) {
+        g_motionSource.store(MOTION_SOURCE_DIRECT_VMD,
+                             std::memory_order_release);
+        Log("[GUI-CMD] Direct VMD mode selected");
       }
       return 0;
     case (WM_USER + 107): 
@@ -1724,7 +1852,8 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       Log("[GUI-CMD] Seek audio: motion=%d ms, audio=%d ms (offset=%.2f)",
           motionMs, audioMs, g_audioOffset);
       if (g_audioPlayer && g_audioPlayer->loaded && g_audioEnabled) {
-        bool motionPlaying = g_musclePlayer && g_musclePlayer->playing;
+        MmdPlayer *player = GetActiveMotionPlayer();
+        bool motionPlaying = player && player->playing;
         g_audioPlayer->Stop();
         if (motionPlaying) {
           g_audioPlayer->PlayFrom(audioMs);
@@ -1746,33 +1875,18 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       return 0;
     case (WM_USER + 106): 
       Log("[GUI-CMD] Re-capture character");
-      if (g_musclePlayer &&
-          (g_musclePlayer->playing || g_musclePlayer->currentTime > 0)) {
-        g_musclePlayer->Stop();
-        g_trojanActive = false;
-        RestoreSkirtColliders();
-        RestoreDisabledComponents();
-        if (g_cameraActive) {
-          RestoreCinemachine();
-          g_cameraActive = false;
-          g_cameraNeedsCapture = false;
-        }
-        SafeSetAnimatorEnabled(true);
-        if (g_audioPlayer) g_audioPlayer->Stop();
-        g_audioIsClock = false;
-        g_audioPendingStart = false;
-        Log("[GUI-CMD] Stopped for character switch");
-      }
+      StopAllMotionPlayback();
       g_cachedAnimator = nullptr;
       s_poseReady = false;
-      ResetMmdPoseSnapshot();
       g_fingerTransformsResolved = false;
       g_fingerRestCaptured = false;
       memset(g_fingerTransforms, 0, sizeof(g_fingerTransforms));
-      g_mouthWeightsFromMuscle.store(false, std::memory_order_release);
       g_bsIndicesResolved = false;
-      ResetPublishedFaceWeights();
       RefreshEntityAnimator();
+      if (IsDirectVmdMode() && g_directVmdPath[0]) {
+        g_directVmdReady.store(false, std::memory_order_release);
+        LoadAndResolveVmdPath(g_directVmdPath);
+      }
       if (g_cachedAnimator) {
         Log("[GUI-CMD] New character captured: animator=%p", g_cachedAnimator);
       } else {
@@ -1794,25 +1908,16 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   return r;
 }
 
-static void MuscleAnimationTick() {
-  if (!g_musclePlayer || !g_musclePlayer->playing || !g_trojanActive)
-    return;
-  if (!g_muscleAnim || !g_muscleAnim->loaded)
-    return;
-
-  if (g_mmdPendingApply)
-    return;
-
-  float prevTime = g_musclePlayer->currentTime;
-  float frameNum =
-      g_musclePlayer->Tick(); 
+static float TickPlaybackClock(MmdPlayer *player) {
+  const float previousTime = player->currentTime;
+  float frame = player->Tick();
 
   if (g_audioPendingStart && g_audioPlayer && g_audioPlayer->loaded) {
-    float expectedAudio = g_musclePlayer->currentTime + g_audioOffset;
+    float expectedAudio = player->currentTime + g_audioOffset;
     if (expectedAudio >= 0.0f) {
       g_audioPendingStart = false;
       if (g_gameHwnd) {
-        int motionMs = (int)(g_musclePlayer->currentTime * 1000.0f);
+        int motionMs = (int)(player->currentTime * 1000.0f);
         PostMessageW(g_gameHwnd, WM_USER + 108, (WPARAM)motionMs, 0);
         Log("[AUDIO] Deferred start: posting seek motion=%d ms", motionMs);
       }
@@ -1820,27 +1925,26 @@ static void MuscleAnimationTick() {
   }
 
   if (g_audioIsClock && g_audioPlayer && g_audioPlayer->loaded) {
-    if (fabsf(g_musclePlayer->speed - 1.0f) > 0.001f) {
+    if (fabsf(player->speed - 1.0f) > 0.001f) {
       g_audioPlayer->Pause();
       g_audioIsClock = false;
       Log("[AUDIO] Speed != 1.0, audio sync disabled");
     } else {
       int posMs = g_audioPlayer->GetPositionMs();
-      if (posMs > 0) { 
+      if (posMs > 0) {
         float audioSec = posMs / 1000.0f - g_audioOffset;
-        float drift = audioSec - g_musclePlayer->currentTime;
-
-        if (fabsf(drift) > 0.15f) {
-          g_musclePlayer->currentTime = audioSec;
-        } else if (fabsf(drift) > 0.005f) {
-          g_musclePlayer->currentTime += drift * 0.1f;
-        }
-        if (g_musclePlayer->currentTime < 0) g_musclePlayer->currentTime = 0;
-        frameNum = g_musclePlayer->currentTime * 30.0f;
+        float drift = audioSec - player->currentTime;
+        if (fabsf(drift) > 0.15f)
+          player->currentTime = audioSec;
+        else if (fabsf(drift) > 0.005f)
+          player->currentTime += drift * 0.1f;
+        if (player->currentTime < 0.0f)
+          player->currentTime = 0.0f;
+        frame = player->currentTime * 30.0f;
       }
 
-      if (g_musclePlayer->loop && prevTime > 0.5f &&
-          g_musclePlayer->currentTime < 0.1f) {
+      if (player->loop && previousTime > 0.5f &&
+          player->currentTime < 0.1f) {
         if (g_audioOffset < 0.0f) {
           g_audioPendingStart = true;
           g_audioIsClock = false;
@@ -1852,146 +1956,230 @@ static void MuscleAnimationTick() {
       }
     }
   }
+  return frame;
+}
 
-  float timeSec =
-      frameNum / g_muscleAnim->fps; 
+static void ApplyVmdMorphFrame(const VmdFile *vmd, float frame) {
+  static const char *mouthNames[NUM_MOUTH_SHAPES] = {
+      "\xe3\x81\x82", "\xe3\x81\x84", "\xe3\x81\x86",
+      "\xe3\x81\x88", "\xe3\x81\x8a"};
+  static const char *mouthLabels[NUM_MOUTH_SHAPES] = {"A", "I", "U", "E",
+                                                       "O"};
+  static const VmdFile *s_source = nullptr;
+  static float s_previousMouth[NUM_MOUTH_SHAPES] = {};
+
+  if (vmd != s_source) {
+    s_source = vmd;
+    memset(s_previousMouth, 0, sizeof(s_previousMouth));
+    ResetPublishedFaceWeights();
+    if (vmd && vmd->loaded) {
+      Log("[MOUTH] VMD morph source: %d timelines",
+          (int)vmd->morphTimelines.size());
+      for (int i = 0; i < NUM_MOUTH_SHAPES; i++) {
+        auto it = vmd->morphTimelines.find(mouthNames[i]);
+        Log("[MOUTH]   %s: %s", mouthLabels[i],
+            it == vmd->morphTimelines.end() ? "NOT FOUND" : "mapped");
+      }
+    }
+  }
+
+  if (!vmd || !vmd->loaded || vmd->morphTimelines.empty()) {
+    g_mouthWeightsFromMuscle.store(false, std::memory_order_release);
+    return;
+  }
+
+  float mouthTargets[NUM_MOUTH_SHAPES] = {};
+  float extraTargets[NUM_EXTRA_MORPHS] = {};
+  for (int i = 0; i < NUM_MOUTH_SHAPES; i++) {
+    auto it = vmd->morphTimelines.find(mouthNames[i]);
+    if (it != vmd->morphTimelines.end())
+      mouthTargets[i] = it->second.Sample(frame);
+  }
+  for (int i = 0; i < NUM_EXTRA_MORPHS; i++) {
+    auto it = vmd->morphTimelines.find(g_extraMorphs[i].vmdNameUtf8);
+    if (it != vmd->morphTimelines.end())
+      extraTargets[i] = it->second.Sample(frame);
+  }
+
+  const float smoothing = 0.25f;
+  AcquireSRWLockExclusive(&g_faceWeightLock);
+  for (int i = 0; i < NUM_MOUTH_SHAPES; i++) {
+    float smoothed = s_previousMouth[i] +
+                     smoothing * (mouthTargets[i] - s_previousMouth[i]);
+    s_previousMouth[i] = smoothed;
+    g_mouthWeights[i] = smoothed;
+  }
+  for (int i = 0; i < NUM_EXTRA_MORPHS; i++) {
+    float smoothed = g_extraMorphs[i].prevWeight +
+                     smoothing *
+                         (extraTargets[i] - g_extraMorphs[i].prevWeight);
+    g_extraMorphs[i].prevWeight = smoothed;
+    g_extraMorphs[i].weight = smoothed;
+  }
+  ReleaseSRWLockExclusive(&g_faceWeightLock);
+  g_mouthWeightsFromMuscle.store(true, std::memory_order_release);
+}
+
+static void UpdateDirectVmdCamera(float timeSeconds) {
+  if (g_cameraNeedsCapture && g_cameraPlayer.HasData()) {
+    g_cameraNeedsCapture = false;
+    __try {
+      void *characterTransform = SafeGetComponentTransform(g_cachedAnimator);
+      if (characterTransform && g_camGetPos) {
+        float position[3] = {};
+        g_camGetPos(characterTransform, position);
+        g_charWorldPos = {position[0], position[1], position[2]};
+        if (g_camGetRot) {
+          float rotation[4] = {};
+          g_camGetRot(characterTransform, rotation);
+          g_charYaw =
+              atan2f(2.0f * (rotation[3] * rotation[1] +
+                             rotation[0] * rotation[2]),
+                     1.0f - 2.0f *
+                                 (rotation[1] * rotation[1] +
+                                  rotation[2] * rotation[2]));
+        }
+      }
+
+      if (g_animator_GetBoneTransform && g_cachedAnimator) {
+        void *hips = SafeGetBoneTransform(HB_Hips);
+        Vec3 hipsPosition;
+        if (hips && ReadWorldPosition(hips, hipsPosition))
+          g_camInitHipsWorldPos = hipsPosition;
+
+        void *head = SafeGetBoneTransform(HB_Head);
+        Vec3 headPosition;
+        if (head && ReadWorldPosition(head, headPosition)) {
+          float height = headPosition.y - g_charWorldPos.y;
+          if (height > 0.1f && height < 5.0f)
+            g_charHeight = height;
+        }
+      }
+      if (g_charHeight > 0.0f && g_camRefHeight <= 0.0f)
+        g_camRefHeight = CAM_REF_HEIGHT;
+      g_camHeightScale =
+          (g_charHeight > 0.0f && g_camRefHeight > 0.0f)
+              ? g_charHeight / g_camRefHeight
+              : 1.0f;
+    } __except (1) {
+      Log("[CAM] Direct VMD character capture failed");
+    }
+
+    CaptureAndDisableCinemachine();
+    g_cameraActive = true;
+    g_camInitInterest = g_cameraPlayer.SampleInterest(0.0f);
+    Log("[CAM] Direct VMD camera activated");
+  }
+
+  if (g_cameraActive)
+    ApplyCameraFrame(timeSeconds);
+}
+
+static void MuscleAnimationTick() {
+  if (!g_musclePlayer || !g_musclePlayer->playing || !g_trojanActive)
+    return;
+  if (!g_muscleAnim || !g_muscleAnim->loaded)
+    return;
+
+  if (g_mmdPendingApply)
+    return;
+
+  float frameNum = TickPlaybackClock(g_musclePlayer);
+
+  float timeSec = frameNum / g_muscleAnim->fps;
   MuscleFrame mf = g_muscleAnim->GetFrame(timeSec);
 
   PublishMmdPoseSnapshot(mf, g_muscleAnim->hasArmBones,
                          g_muscleAnim->hasFingerBones);
 
-  if (!g_vmd && !g_bsIndicesResolved) {
-    g_bsIndicesResolved = true; 
+  if (g_morphVmdReloadRequested.exchange(false,
+                                          std::memory_order_acq_rel)) {
+    AcquireSRWLockExclusive(&g_vmdLock);
+    if (g_vmd) {
+      FreeVmd(g_vmd);
+      g_vmd = nullptr;
+    }
+    g_bsIndicesResolved = false;
+    g_activeMorphTracks.store(0, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_vmdLock);
+  }
 
-    if (g_morphVmdPath[0] != '\0') {
-      VmdFile *v = LoadVmd(g_morphVmdPath);
-      if (v && v->loaded && !v->morphTimelines.empty()) {
-        g_vmd = v;
-        Log("[MOUTH] User morph VMD loaded: %s (%d morph timelines)",
-            g_morphVmdPath, (int)v->morphTimelines.size());
+  if (!g_bsIndicesResolved) {
+    AcquireSRWLockExclusive(&g_vmdLock);
+    if (!g_vmd && !g_bsIndicesResolved) {
+      g_bsIndicesResolved = true;
+
+      if (g_morphVmdPath[0] != '\0') {
+        VmdFile *v = LoadVmd(g_morphVmdPath);
+        if (v && v->loaded && !v->morphTimelines.empty()) {
+          g_vmd = v;
+          Log("[MOUTH] User morph VMD loaded: %s (%d morph timelines)",
+              g_morphVmdPath, (int)v->morphTimelines.size());
+        } else {
+          Log("[MOUTH] User morph VMD load failed or no morphs: %s",
+              g_morphVmdPath);
+          if (v)
+            FreeVmd(v);
+        }
       } else {
-        Log("[MOUTH] User morph VMD load failed or no morphs: %s", g_morphVmdPath);
-        if (v) FreeVmd(v);
-      }
-    } else {
-      WIN32_FIND_DATAA fd;
-      HANDLE hFind = FindFirstFileA("plugin\\*.vmd", &fd);
-      if (hFind != INVALID_HANDLE_VALUE) {
-        VmdFile *bestVmd = nullptr;
-        char bestName[MAX_PATH] = {};
-        int bestMorphCount = -1;
-        do {
-          if (_stricmp(fd.cFileName, "camera.vmd") == 0) continue;
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA("plugin\\*.vmd", &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+          VmdFile *bestVmd = nullptr;
+          char bestName[MAX_PATH] = {};
+          int bestMorphCount = -1;
+          do {
+            if (_stricmp(fd.cFileName, "camera.vmd") == 0)
+              continue;
 
-          char vmdPath[MAX_PATH];
-          snprintf(vmdPath, sizeof(vmdPath), "plugin\\%s", fd.cFileName);
-          VmdFile *candidate = LoadVmd(vmdPath);
-          if (!candidate || !candidate->loaded) {
-            Log("[MOUTH] VMD load failed: %s", fd.cFileName);
-            if (candidate) FreeVmd(candidate);
-            continue;
-          }
-          int mc = (int)candidate->morphTimelines.size();
-          Log("[MOUTH] Scanned %s: %d morph timelines, %u frames",
-              fd.cFileName, mc, candidate->totalFrames);
-          if (mc > bestMorphCount) {
-            if (bestVmd) FreeVmd(bestVmd);
-            bestVmd = candidate;
-            bestMorphCount = mc;
-            strncpy(bestName, fd.cFileName, MAX_PATH - 1);
+            char vmdPath[MAX_PATH];
+            snprintf(vmdPath, sizeof(vmdPath), "plugin\\%s", fd.cFileName);
+            VmdFile *candidate = LoadVmd(vmdPath);
+            if (!candidate || !candidate->loaded) {
+              Log("[MOUTH] VMD load failed: %s", fd.cFileName);
+              if (candidate)
+                FreeVmd(candidate);
+              continue;
+            }
+            int mc = (int)candidate->morphTimelines.size();
+            Log("[MOUTH] Scanned %s: %d morph timelines, %u frames",
+                fd.cFileName, mc, candidate->totalFrames);
+            if (mc > bestMorphCount) {
+              if (bestVmd)
+                FreeVmd(bestVmd);
+              bestVmd = candidate;
+              bestMorphCount = mc;
+              strncpy(bestName, fd.cFileName, MAX_PATH - 1);
+            } else {
+              FreeVmd(candidate);
+            }
+          } while (FindNextFileA(hFind, &fd));
+          FindClose(hFind);
+
+          if (bestVmd && bestMorphCount > 0) {
+            g_vmd = bestVmd;
+            Log("[MOUTH] Selected %s as morph source: %d morph timelines",
+                bestName, bestMorphCount);
+          } else if (bestVmd) {
+            FreeVmd(bestVmd);
+            Log("[MOUTH] No VMD with morph timelines found in plugin/");
           } else {
-            FreeVmd(candidate);
+            Log("[MOUTH] Only camera.vmd found, no morph VMD");
           }
-        } while (FindNextFileA(hFind, &fd));
-        FindClose(hFind);
-
-        if (bestVmd && bestMorphCount > 0) {
-          g_vmd = bestVmd;
-          Log("[MOUTH] Selected %s as morph source: %d morph timelines",
-              bestName, bestMorphCount);
-        } else if (bestVmd) {
-          FreeVmd(bestVmd);
-          Log("[MOUTH] No VMD with morph timelines found in plugin/");
         } else {
-          Log("[MOUTH] Only camera.vmd found, no morph VMD");
-        }
-      } else {
-        Log("[MOUTH] No .vmd file found in plugin/ dir for morph data");
-      }
-    }
-  }
-
-  if (g_vmd && g_vmd->loaded && !g_vmd->morphTimelines.empty()) {
-    static const char *morphNames[5] = {
-        "\xe3\x81\x82", 
-        "\xe3\x81\x84", 
-        "\xe3\x81\x86", 
-        "\xe3\x81\x88", 
-        "\xe3\x81\x8a", 
-    };
-
-    static bool s_morphMapped = false;
-    if (!s_morphMapped) {
-      s_morphMapped = true;
-      static const char *labelNames[5] = {"A", "I", "U", "E", "O"};
-      Log("[MOUTH] VMD morph timelines: %d total",
-          (int)g_vmd->morphTimelines.size());
-      for (int i = 0; i < 5; i++) {
-        auto it = g_vmd->morphTimelines.find(morphNames[i]);
-        if (it != g_vmd->morphTimelines.end()) {
-          float peak = 0;
-          for (auto &k : it->second.keys)
-            if (k.weight > peak)
-              peak = k.weight;
-          Log("[MOUTH]   %s: %d keys (peak=%.2f)", labelNames[i],
-              (int)it->second.keys.size(), peak);
-        } else {
-          Log("[MOUTH]   %s: NOT FOUND in VMD", labelNames[i]);
+          Log("[MOUTH] No .vmd file found in plugin/ dir for morph data");
         }
       }
-
-      for (auto &pair : g_vmd->morphTimelines) {
-        float peak = 0;
-        float firstW = pair.second.keys.empty() ? 0 : pair.second.keys.front().weight;
-        for (auto &k : pair.second.keys)
-          if (k.weight > peak) peak = k.weight;
-        Log("[MOUTH-ALL]   %s: %d keys (peak=%.2f, frame0=%.2f)",
-            pair.first.c_str(), (int)pair.second.keys.size(), peak, firstW);
-      }
+      g_activeMorphTracks.store(
+          g_vmd ? (int)g_vmd->morphTimelines.size() : 0,
+          std::memory_order_release);
     }
-
-    static float s_prevMouthWeights[5] = {};
-    static float s_mouthAlpha =
-        0.25f; 
-
-    AcquireSRWLockExclusive(&g_faceWeightLock);
-    for (int i = 0; i < 5; i++) {
-      float target = 0.0f;
-      auto it = g_vmd->morphTimelines.find(morphNames[i]);
-      if (it != g_vmd->morphTimelines.end()) {
-        target = it->second.Sample(frameNum);
-      }
-      float smoothed = s_prevMouthWeights[i] +
-                       s_mouthAlpha * (target - s_prevMouthWeights[i]);
-      s_prevMouthWeights[i] = smoothed;
-      g_mouthWeights[i] = smoothed;
-    }
-
-    static float s_extraAlpha = 0.25f;
-    for (int em = 0; em < NUM_EXTRA_MORPHS; em++) {
-      float target = 0.0f;
-      auto it = g_vmd->morphTimelines.find(g_extraMorphs[em].vmdNameUtf8);
-      if (it != g_vmd->morphTimelines.end()) {
-        target = it->second.Sample(frameNum);
-      }
-      float smoothed = g_extraMorphs[em].prevWeight +
-                       s_extraAlpha * (target - g_extraMorphs[em].prevWeight);
-      g_extraMorphs[em].prevWeight = smoothed;
-      g_extraMorphs[em].weight = smoothed;
-    }
-    ReleaseSRWLockExclusive(&g_faceWeightLock);
-    g_mouthWeightsFromMuscle.store(true, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_vmdLock);
   }
+
+  AcquireSRWLockShared(&g_vmdLock);
+  ApplyVmdMorphFrame(g_vmd, frameNum);
+  ReleaseSRWLockShared(&g_vmdLock);
 
   QueueMmdPoseApply();
 
@@ -2010,16 +2198,17 @@ static void AnimationTick() {
     CalibrationTick();
     return;
   }
-  if (!g_player || !g_player->playing)
+  AcquireSRWLockShared(&g_vmdLock);
+  if (!g_player || !g_player->playing || !g_vmd || !g_vmd->loaded ||
+      !g_resolvedMappings ||
+      g_resolvedMappings->empty()) {
+    ReleaseSRWLockShared(&g_vmdLock);
     return;
-  if (!g_vmd || !g_vmd->loaded)
-    return;
-  if (!g_resolvedMappings || g_resolvedMappings->empty())
-    return;
+  }
 
   SafeSetAnimatorEnabled(false);
 
-  float frame = g_player->Tick();
+  float frame = TickPlaybackClock(g_player);
 
   FILE *dumpF = nullptr;
   if (!s_dumpedFrame0 && frame < 1.0f) {
@@ -2105,4 +2294,7 @@ static void AnimationTick() {
     fclose(dumpF);
     dumpF = nullptr;
   }
+  ApplyVmdMorphFrame(g_vmd, frame);
+  UpdateDirectVmdCamera(g_player->currentTime);
+  ReleaseSRWLockShared(&g_vmdLock);
 }

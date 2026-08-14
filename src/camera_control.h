@@ -204,14 +204,23 @@ static void RestoreCinemachine() {
 
 static Vec3 SampleCharDisplacement(float timeSec) {
   Vec3 disp = {0, 0, 0};
-  if (!g_vmd) return disp;
-  auto it = g_vmd->boneTimelines.find(
-      "\xe3\x82\xbb\xe3\x83\xb3\xe3\x82\xbf\xe3\x83\xbc"); 
-  if (it != g_vmd->boneTimelines.end()) {
-    float frameF = timeSec * 30.0f;
-    InterpResult ir = InterpolateBone(it->second.keys, frameF, true);
-    disp = ir.position;
+  // Direct playback already owns the shared VMD lock while applying its
+  // camera.  MUS4 camera updates run on another thread and take the lock here.
+  const bool acquireLock = !IsDirectVmdMode();
+  if (acquireLock)
+    AcquireSRWLockShared(&g_vmdLock);
+  const VmdFile *vmd = g_vmd;
+  if (vmd) {
+    auto it = vmd->boneTimelines.find(
+        "\xe3\x82\xbb\xe3\x83\xb3\xe3\x82\xbf\xe3\x83\xbc");
+    if (it != vmd->boneTimelines.end()) {
+      float frameF = timeSec * 30.0f;
+      InterpResult ir = InterpolateBone(it->second.keys, frameF, true);
+      disp = ir.position;
+    }
   }
+  if (acquireLock)
+    ReleaseSRWLockShared(&g_vmdLock);
   return disp;
 }
 
@@ -312,4 +321,3 @@ static void ApplyCameraFrame(float timeSec) {
   } __except (1) {
   }
 }
-

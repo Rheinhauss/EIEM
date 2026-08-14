@@ -31,13 +31,13 @@ example: [bilibili](https://www.bilibili.com/video/BV1YdEC6bEfP/)
 
 ### Implemented
 - **Muscle-driven motion**: Drives full-body animation via 95 muscle values
+- **Direct VMD playback**: Parses VMD bone, position, and morph tracks without a Unity conversion step
 - **Finger animation**: Independent rotation control for 30 finger bones
 - **Facial expressions**: Basic expressions including AIUEO, blinks, and smiling eyes
 - **Camera motion**: VMD camera keyframes (with character-facing alignment)
 - **Audio sync**: MCI backend plays WAV/MP3 BGM
 
 ### Planned
-- Direct VMD playback mode
 - Multi-character screen playback
 - ...
 
@@ -65,8 +65,8 @@ Auto-scans `game_dir/plugin/` or manually specify the following files:
 
 | File | Description | Required |
 |------|-------------|----------|
-| `muscle_anim.bin` | MUS4-format motion data (exported via ExportMuscleAnimation.cs) | **Yes** |
-| `*.vmd` | VMD file (facial expression morph data) | Optional (auto-scans .vmd in plugin dir) |
+| `muscle_anim.bin` | MUS4-format motion data (exported via ExportMuscleAnimation.cs) | Choose this or direct VMD |
+| `*.vmd` | Directly playable VMD motion; can also provide morph data in MUS4 mode | Choose this or MUS4 / Optional |
 | `camera.vmd` | Camera motion data | Optional |
 | `bgm.wav` or `bgm.mp3` | Background music | Optional |
 
@@ -74,11 +74,12 @@ Auto-scans `game_dir/plugin/` or manually specify the following files:
 
 1. Install as described above, launch the game, and enter the game.
 2. Press **Insert** to open the GUI panel.
-3. Load the desired files, then click the **Play** button on the "Control" tab to start playback.
+3. On the "Files" tab, load a MUS4 motion or select "Direct VMD Motion" and click "Load and Switch."
+4. Click **Play** on the "Control" tab. Pause, seek, loop, camera, and audio controls work in both modes.
 
-## Motion Export (VMD → MUS4)
+## Optional: Motion Export (VMD → MUS4)
 
-You must first convert VMD animations to MUS4 format (`muscle_anim.bin`) using the Unity editor.
+Direct playback requires no conversion. To use Humanoid muscle retargeting instead, convert the VMD animation to MUS4 format (`muscle_anim.bin`) with the Unity editor.
 
 ### Prerequisites
 

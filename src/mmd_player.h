@@ -24,6 +24,46 @@ static Vec3 Vec3Lerp(Vec3 a, Vec3 b, float t) {
            a.z + (b.z - a.z) * t };
 }
 
+static float VmdBezierAxis(float p1, float p2, float t) {
+  const float u = 1.0f - t;
+  return 3.0f * u * u * t * p1 + 3.0f * u * t * t * p2 + t * t * t;
+}
+
+static float VmdBezierEval(uint8_t x1Byte, uint8_t y1Byte,
+                           uint8_t x2Byte, uint8_t y2Byte, float time) {
+  if (time <= 0.0f)
+    return 0.0f;
+  if (time >= 1.0f)
+    return 1.0f;
+
+  const float x1 = x1Byte / 127.0f;
+  const float y1 = y1Byte / 127.0f;
+  const float x2 = x2Byte / 127.0f;
+  const float y2 = y2Byte / 127.0f;
+  if (fabsf(x1 - y1) < 1e-4f && fabsf(x2 - y2) < 1e-4f)
+    return time;
+
+  // Solve BezierX(parameter) = time, then evaluate BezierY(parameter).
+  float parameter = time;
+  for (int i = 0; i < 12; i++) {
+    const float xError = VmdBezierAxis(x1, x2, parameter) - time;
+    if (fabsf(xError) < 1e-5f)
+      break;
+    const float u = 1.0f - parameter;
+    const float derivative =
+        3.0f * u * u * x1 + 6.0f * u * parameter * (x2 - x1) +
+        3.0f * parameter * parameter * (1.0f - x2);
+    if (fabsf(derivative) < 1e-6f)
+      break;
+    parameter -= xError / derivative;
+    if (parameter < 0.0f)
+      parameter = 0.0f;
+    if (parameter > 1.0f)
+      parameter = 1.0f;
+  }
+  return VmdBezierAxis(y1, y2, parameter);
+}
+
 static float QuatDot(Quat a, Quat b) {
   return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
@@ -188,12 +228,21 @@ static InterpResult InterpolateBone(
 
   Quat qa = { prev.rot[0], prev.rot[1], prev.rot[2], prev.rot[3] };
   Quat qb = { next.rot[0], next.rot[1], next.rot[2], next.rot[3] };
-  result.rotation = QuatSlerp(qa, qb, t);
+  const uint8_t *curve = next.interp;
+  const float rotationT =
+      VmdBezierEval(curve[3], curve[7], curve[11], curve[15], t);
+  result.rotation = QuatSlerp(qa, qb, rotationT);
 
   if (isPositionBone) {
     Vec3 pa = { prev.pos[0], prev.pos[1], prev.pos[2] };
     Vec3 pb = { next.pos[0], next.pos[1], next.pos[2] };
-    result.position = Vec3Lerp(pa, pb, t);
+    result.position = {
+        pa.x + (pb.x - pa.x) *
+                   VmdBezierEval(curve[0], curve[4], curve[8], curve[12], t),
+        pa.y + (pb.y - pa.y) *
+                   VmdBezierEval(curve[1], curve[5], curve[9], curve[13], t),
+        pa.z + (pb.z - pa.z) *
+                   VmdBezierEval(curve[2], curve[6], curve[10], curve[14], t)};
   }
 
   return result;

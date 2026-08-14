@@ -1,125 +1,133 @@
 #pragma once
 
-static void LoadAndResolveVmd(HWND hwnd) {
-  char filePath[MAX_PATH] = {0};
-  OPENFILENAMEA ofn = {};
-  ofn.lStructSize = sizeof(ofn);
-  ofn.hwndOwner = hwnd;
-  ofn.lpstrFilter = "VMD Files (*.vmd)\0*.vmd\0All Files\0*.*\0";
-  ofn.lpstrFile = filePath;
-  ofn.nMaxFile = MAX_PATH;
-  ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
-  ofn.lpstrTitle = "EIEM - Select VMD File";
-
-  if (!GetOpenFileNameA(&ofn)) {
-    Log("[VMD] File dialog cancelled");
-    return;
+static bool LoadAndResolveVmdPath(const char *path) {
+  if (!path || !path[0]) {
+    Log("[VMD-DIRECT] No VMD path selected");
+    return false;
   }
 
-  Log("[VMD] Loading: %s", filePath);
-
-  if (g_vmd) {
-    FreeVmd(g_vmd);
-    g_vmd = nullptr;
+  Log("[VMD-DIRECT] Loading: %s", path);
+  VmdFile *loaded = LoadVmd(path);
+  if (!loaded || !loaded->loaded) {
+    Log("[VMD-DIRECT] ERROR: %s",
+        loaded ? loaded->error.c_str() : "allocation failed");
+    FreeVmd(loaded);
+    return false;
   }
-  if (!g_resolvedMappings)
-    g_resolvedMappings = new std::vector<ResolvedBoneMapping>();
-  g_resolvedMappings->clear();
-
-  g_vmd = LoadVmd(filePath);
-  if (!g_vmd->loaded) {
-    Log("[VMD] ERROR: %s", g_vmd->error.c_str());
-    return;
+  if (loaded->boneTimelines.empty()) {
+    Log("[VMD-DIRECT] ERROR: file has no bone motion");
+    FreeVmd(loaded);
+    return false;
   }
 
-  Log("[VMD] Loaded OK: model=%s, frames=%u (%.1f sec), %zu bone timelines",
-      g_vmd->modelName, g_vmd->totalFrames, g_vmd->totalFrames / 30.0f,
-      g_vmd->boneTimelines.size());
+  std::vector<ResolvedBoneMapping> resolvedMappings;
+
+  Log("[VMD-DIRECT] Loaded: model=%s, frames=%u (%.1f sec), bones=%zu, "
+      "morphs=%zu",
+      loaded->modelName, loaded->totalFrames, loaded->totalFrames / 30.0f,
+      loaded->boneTimelines.size(), loaded->morphTimelines.size());
+
+  RefreshEntityAnimator();
+  void *charRootTransform = nullptr;
+  if (g_cachedAnimator && g_component_get_transform)
+    charRootTransform = SafeGetComponentTransform(g_cachedAnimator);
 
   FILE *dumpFile = fopen("plugin/eiem_vmd_dump.txt", "w");
+  const bool wroteDump = dumpFile != nullptr;
   if (dumpFile) {
-    DumpVmd(g_vmd, dumpFile);
-
+    DumpVmd(loaded, dumpFile);
     fprintf(dumpFile, "\n=== Bone Mapping Resolution ===\n");
-    RefreshEntityAnimator();
+  }
 
-    void *charRootTransform = nullptr;
-    if (g_cachedAnimator && g_component_get_transform) {
-      charRootTransform = SafeGetComponentTransform(g_cachedAnimator);
+  int mapped = 0;
+  int unmapped = 0;
+  for (const auto &pair : loaded->boneTimelines) {
+    const std::string &mmdName = pair.first;
+    int humanBone = LookupBoneMapping(mmdName);
+
+    ResolvedBoneMapping rm;
+    rm.mmdName = mmdName;
+    rm.humanBone = humanBone;
+    rm.isPositionBone = IsBonePositionMapped(mmdName);
+
+    if (humanBone >= 0 && g_cachedAnimator && g_animator_GetBoneTransform) {
+      rm.transform = SafeGetBoneTransform(humanBone);
+      rm.valid = rm.transform != nullptr;
     }
-    if (charRootTransform) {
-      Log("[VMD] Character root Transform: %p", charRootTransform);
-    } else {
-      Log("[VMD] WARNING: No character root Transform, finger bones won't "
-          "resolve");
-    }
-    int mapped = 0, unmapped = 0;
-    for (const auto &pair : g_vmd->boneTimelines) {
-      const std::string &mmdName = pair.first;
-      int humanBone = LookupBoneMapping(mmdName);
-      bool isPos = IsBonePositionMapped(mmdName);
 
-      ResolvedBoneMapping rm;
-      rm.mmdName = mmdName;
-      rm.humanBone = humanBone;
-      rm.isPositionBone = isPos;
-      rm.transform = nullptr;
-      rm.valid = false;
-
-      if (humanBone >= 0 && g_cachedAnimator && g_animator_GetBoneTransform) {
-        void *t = SafeGetBoneTransform(humanBone);
-        if (t) {
-          rm.transform = t;
+    if (!rm.valid) {
+      const char *transformName = LookupFingerMapping(mmdName);
+      if (transformName && charRootTransform) {
+        rm.transform =
+            SafeFindChildRecursive(charRootTransform, transformName, 15);
+        if (rm.transform) {
+          rm.transformName = transformName;
+          rm.isFingerBone = true;
           rm.valid = true;
         }
       }
-
-      if (!rm.valid) {
-        const char *fingerName = LookupFingerMapping(mmdName);
-        if (fingerName && charRootTransform) {
-          void *t = SafeFindChildRecursive(charRootTransform, fingerName, 15);
-          if (t) {
-            rm.transform = t;
-            rm.transformName = fingerName;
-            rm.isFingerBone = true;
-            rm.valid = true;
-          }
-        }
-      }
-
-      if (rm.valid) {
-        char bname[256] = {0};
-        if (g_object_get_name)
-          SafeGetBoneName(rm.transform, bname, sizeof(bname));
-        fprintf(dumpFile, "  [OK] \"%s\" -> %s[%s] -> \"%s\" (%zu keys)%s\n",
-                mmdName.c_str(), rm.isFingerBone ? "Finger" : "HumanBone",
-                rm.isFingerBone ? rm.transformName.c_str()
-                                : std::to_string(humanBone).c_str(),
-                bname, pair.second.keys.size(), isPos ? " [POS]" : "");
-        mapped++;
-      } else if (humanBone >= 0 || LookupFingerMapping(mmdName)) {
-        fprintf(dumpFile,
-                "  [--] \"%s\" -> mapped but no Transform (%zu keys)\n",
-                mmdName.c_str(), pair.second.keys.size());
-        unmapped++;
-      } else {
-        fprintf(dumpFile, "  [??] \"%s\" -> NO MAPPING (%zu keys)\n",
-                mmdName.c_str(), pair.second.keys.size());
-        unmapped++;
-      }
-
-      g_resolvedMappings->push_back(rm);
     }
 
+    if (rm.valid) {
+      mapped++;
+      if (dumpFile) {
+        char boneName[256] = {0};
+        if (g_object_get_name)
+          SafeGetBoneName(rm.transform, boneName, sizeof(boneName));
+        std::string target = rm.isFingerBone ? rm.transformName
+                                             : std::to_string(humanBone);
+        fprintf(dumpFile,
+                "  [OK] \"%s\" -> %s[%s] -> \"%s\" (%zu keys)%s\n",
+                mmdName.c_str(), rm.isFingerBone ? "Transform" : "HumanBone",
+                target.c_str(), boneName, pair.second.keys.size(),
+                rm.isPositionBone ? " [POS]" : "");
+      }
+    } else {
+      unmapped++;
+      if (dumpFile) {
+        fprintf(dumpFile, "  [??] \"%s\" -> NO TRANSFORM (%zu keys)\n",
+                mmdName.c_str(), pair.second.keys.size());
+      }
+    }
+    resolvedMappings.push_back(rm);
+  }
+
+  if (dumpFile) {
     fprintf(dumpFile, "\nMapped: %d, Unmapped: %d, Total: %d\n", mapped,
             unmapped, mapped + unmapped);
     fclose(dumpFile);
-
-    Log("[VMD] Bone mapping: %d mapped, %d unmapped. See eiem_vmd_dump.txt",
-        mapped, unmapped);
   }
-}
 
+  if (mapped <= 0) {
+    Log("[VMD-DIRECT] ERROR: no VMD bones map to the active character");
+    FreeVmd(loaded);
+    return false;
+  }
+
+  AcquireSRWLockExclusive(&g_vmdLock);
+  if (g_vmd)
+    FreeVmd(g_vmd);
+  g_vmd = loaded;
+  if (!g_resolvedMappings)
+    g_resolvedMappings = new std::vector<ResolvedBoneMapping>();
+  g_resolvedMappings->swap(resolvedMappings);
+
+  g_directMappedBones.store(mapped, std::memory_order_release);
+  g_directUnmappedBones.store(unmapped, std::memory_order_release);
+  g_directTotalFrames.store(loaded->totalFrames, std::memory_order_release);
+  g_directBoneTracks.store((int)loaded->boneTimelines.size(),
+                           std::memory_order_release);
+  g_directMorphTracks.store((int)loaded->morphTimelines.size(),
+                            std::memory_order_release);
+  g_activeMorphTracks.store((int)loaded->morphTimelines.size(),
+                            std::memory_order_release);
+  g_directVmdReady.store(true, std::memory_order_release);
+  s_dumpedFrame0 = false;
+  ReleaseSRWLockExclusive(&g_vmdLock);
+  Log("[VMD-DIRECT] Bone mapping: %d mapped, %d unmapped%s", mapped,
+      unmapped, wroteDump ? " (see eiem_vmd_dump.txt)" : "");
+  return true;
+}
 
 #include "camera_control.h"
 
@@ -170,7 +178,10 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
       ApplyCameraFrame(0.0f);
     }
 
-    Sleep((g_musclePlayer && g_musclePlayer->playing) || g_camTestMode ? 0 : 50);
+    MmdPlayer *activePlayer = GetActiveMotionPlayer();
+    const bool motionPlaying = activePlayer && activePlayer->playing;
+    Sleep(motionPlaying ? (IsDirectVmdMode() ? 1 : 0)
+                        : (g_camTestMode ? 0 : 50));
   }
 
   Log("[INFO] Game window closed, hotkey thread exiting");
@@ -972,6 +983,15 @@ static DWORD WINAPI InitThread(LPVOID) {
           g_skeletalMorphCore = nullptr;
           g_boneMapReady = false;
           ResetFaceCache();
+          if (IsDirectVmdMode()) {
+            AcquireSRWLockExclusive(&g_vmdLock);
+            if (g_player)
+              g_player->Stop();
+            ReleaseSRWLockExclusive(&g_vmdLock);
+            g_directVmdReady.store(false, std::memory_order_release);
+            if (g_gameHwnd)
+              PostMessageW(g_gameHwnd, WM_USER + 106, 0, 0);
+          }
           Log("[SWITCH] SMC tracking reset for new character");
         }
       };
