@@ -111,6 +111,8 @@ static void SafeRefreshEntity() {
 }
 
 static void *SafeGetBoneTransform(int humanBone) {
+  if (!g_animator_GetBoneTransform || !g_cachedAnimator)
+    return nullptr;
   __try {
     void *params[] = {&humanBone};
     return Invoke(g_animator_GetBoneTransform, g_cachedAnimator, params);

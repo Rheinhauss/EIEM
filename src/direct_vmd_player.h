@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,10 +29,14 @@ struct DirectBoneBinding {
   DirectMotionPart part = DIRECT_PART_SPINE;
   Quat bindLocal = {0, 0, 0, 1};
   Quat parentBindFromRoot = {0, 0, 0, 1};
+  Quat armTwistRetargetRoot = {0, 0, 0, 1};
+  Quat elbowHingeRetargetRoot = {0, 0, 0, 1};
   Vec3 bindPosition = {0, 0, 0};
   bool controlsPosition = false;
   bool isRootChannel = false;
   bool cancelsLowerBody = false;
+  bool armTwistRetargetReady = false;
+  bool elbowHingeRetargetReady = false;
   std::vector<DirectSourceTrack> tracks;
 };
 
@@ -116,6 +121,29 @@ static void *DirectGetParentTransform(void *transform) {
   }
 }
 
+static int DirectGetChildCount(void *transform) {
+  if (!transform || !g_transform_get_childCount)
+    return 0;
+  __try {
+    void *boxed = Invoke(g_transform_get_childCount, transform);
+    const int count = boxed ? *(int *)((char *)boxed + 16) : 0;
+    return count > 0 && count < 4096 ? count : 0;
+  } __except (1) {
+    return 0;
+  }
+}
+
+static void *DirectGetChild(void *transform, int index) {
+  if (!transform || index < 0 || !g_transform_GetChild)
+    return nullptr;
+  __try {
+    void *args[] = {&index};
+    return Invoke(g_transform_GetChild, transform, args);
+  } __except (1) {
+    return nullptr;
+  }
+}
+
 // Multiple source tracks intentionally target the same game bone. BuildBindings
 // groups them by Transform and preserves this MMD hierarchy order.
 static const DirectMapEntry g_directMap[] = {
@@ -167,6 +195,7 @@ struct DirectVmdMotion {
   int ikTracks = 0;
   float positionScale = 0.08f;
   Quat rootBasis = {0, 0, 0, 1};
+  bool analyzed = false;
   bool prepared = false;
   std::string error;
 
@@ -356,6 +385,7 @@ struct DirectVmdMotion {
   }
 
   void AddFingerTracks(void *root, std::vector<std::string> &seen) {
+    std::vector<const FingerMapEntry *> requested;
     for (int i = 0; i < g_fingerMapCount; ++i) {
       const FingerMapEntry &entry = g_fingerMap[i];
       if (!strstr(entry.transformName, "Finger"))
@@ -363,9 +393,51 @@ struct DirectVmdMotion {
       auto timelineIt = vmd->boneTimelines.find(entry.mmdName);
       if (timelineIt == vmd->boneTimelines.end())
         continue;
+      requested.push_back(&entry);
+    }
+
+    std::vector<void *> resolved(requested.size(), nullptr);
+    if (root && !requested.empty()) {
+      struct WalkItem {
+        void *transform;
+        int depth;
+      };
+      WalkItem stack[4096];
+      size_t top = 0;
+      size_t visited = 0;
+      size_t resolvedCount = 0;
+      stack[top++] = {root, 0};
+      while (top > 0 && visited < 4096 && resolvedCount < requested.size()) {
+        const WalkItem item = stack[--top];
+        ++visited;
+        char name[256] = {};
+        SafeGetBoneName(item.transform, name, (int)sizeof(name));
+        if (name[0]) {
+          for (size_t i = 0; i < requested.size(); ++i) {
+            if (!resolved[i] && strcmp(name, requested[i]->transformName) == 0) {
+              resolved[i] = item.transform;
+              ++resolvedCount;
+            }
+          }
+        }
+        if (item.depth >= 15)
+          continue;
+        const int childCount = DirectGetChildCount(item.transform);
+        for (int i = childCount - 1; i >= 0 && top < 4096; --i) {
+          void *child = DirectGetChild(item.transform, i);
+          if (child)
+            stack[top++] = {child, item.depth + 1};
+        }
+      }
+      Log("[VMD-DIRECT] Hierarchy scan: visited=%zu resolved=%zu/%zu",
+          visited, resolvedCount, requested.size());
+    }
+
+    for (size_t i = 0; i < requested.size(); ++i) {
+      const FingerMapEntry &entry = *requested[i];
+      auto timelineIt = vmd->boneTimelines.find(entry.mmdName);
       seen.push_back(entry.mmdName);
-      void *transform = root ? SafeFindChildRecursive(root, entry.transformName, 15)
-                             : nullptr;
+      void *transform = resolved[i];
       if (!transform) {
         ++unmappedTracks;
         continue;
@@ -378,6 +450,92 @@ struct DirectVmdMotion {
       track.timeline = &timelineIt->second;
       binding->tracks.push_back(track);
       ++mappedTracks;
+    }
+  }
+
+  static bool IsArmTwistTrack(const std::string &name) {
+    return name == u8"左腕捩" || name == u8"右腕捩" ||
+           name == u8"左手捩" || name == u8"右手捩";
+  }
+
+  static bool IsElbowTrack(const std::string &name) {
+    return name == u8"左ひじ" || name == u8"右ひじ";
+  }
+
+  static bool IsLeftArmTrack(const std::string &name) {
+    return name == u8"左腕" || name == u8"左腕捩" ||
+           name == u8"左ひじ" || name == u8"左手捩" ||
+           name == u8"左手首";
+  }
+
+  void CaptureArmAxes(DirectBoneBinding &binding, Quat rootWorld) {
+    const bool upper = binding.humanBone == HB_LeftUpperArm ||
+                       binding.humanBone == HB_RightUpperArm;
+    const bool lower = binding.humanBone == HB_LeftLowerArm ||
+                       binding.humanBone == HB_RightLowerArm;
+    if (!upper && !lower)
+      return;
+    // Do not calibrate an optional-bone fallback Transform as an arm segment.
+    if (SafeGetBoneTransform(binding.humanBone) != binding.transform)
+      return;
+
+    const bool left = binding.humanBone == HB_LeftUpperArm ||
+                      binding.humanBone == HB_LeftLowerArm;
+    const int childBone = upper
+        ? (left ? HB_LeftLowerArm : HB_RightLowerArm)
+        : (left ? HB_LeftHand : HB_RightHand);
+    void *child = SafeGetBoneTransform(childBone);
+    Vec3 startPosition, endPosition;
+    if (!child || !ReadWorldPosition(binding.transform, startPosition) ||
+        !ReadWorldPosition(child, endPosition))
+      return;
+
+    const Quat rootInverse = QuatInv(rootWorld);
+    const Vec3 targetAxisRoot = Vec3Normalize(QuatRotate(
+        rootInverse, Vec3Sub(endPosition, startPosition)));
+    if (Vec3Dot(targetAxisRoot, targetAxisRoot) < 0.5f)
+      return;
+    const Vec3 sourceAxisRoot = QuatRotate(
+        rootBasis, left ? Vec3{-1, 0, 0} : Vec3{1, 0, 0});
+    binding.armTwistRetargetRoot =
+        QuatFromTo(sourceAxisRoot, targetAxisRoot);
+    binding.armTwistRetargetReady = true;
+
+    if (lower) {
+      const Vec3 anatomicalForwardRoot =
+          QuatRotate(rootBasis, {0, 0, 1});
+      Vec3 bendDirection = Vec3Sub(
+          anatomicalForwardRoot,
+          Vec3Scale(targetAxisRoot,
+                    Vec3Dot(anatomicalForwardRoot, targetAxisRoot)));
+      bendDirection = Vec3Normalize(bendDirection);
+      const Vec3 targetHingeRoot =
+          Vec3Normalize(Vec3Cross(targetAxisRoot, bendDirection));
+      const Vec3 sourceHingeRoot = QuatRotate(
+          rootBasis, left ? Vec3{0, 1, 0} : Vec3{0, -1, 0});
+      if (Vec3Dot(targetHingeRoot, targetHingeRoot) > 0.5f) {
+        binding.elbowHingeRetargetRoot =
+            QuatFromTo(sourceHingeRoot, targetHingeRoot);
+        binding.elbowHingeRetargetReady = true;
+      }
+    }
+
+    Log("[VMD-DIRECT] Arm axes bone=%d twist=%d hinge=%d",
+        binding.humanBone, binding.armTwistRetargetReady ? 1 : 0,
+        binding.elbowHingeRetargetReady ? 1 : 0);
+  }
+
+  static bool HasSeenTrack(const std::vector<std::string> &seen,
+                           const std::string &name) {
+    return std::find(seen.begin(), seen.end(), name) != seen.end();
+  }
+
+  static void MarkSupportedTrack(std::vector<std::string> &seen,
+                                 const std::string &name,
+                                 int &supportedCount) {
+    if (!HasSeenTrack(seen, name)) {
+      seen.push_back(name);
+      ++supportedCount;
     }
   }
 
@@ -496,7 +654,72 @@ struct DirectVmdMotion {
                                         : it->second.Sample(frame, true);
   }
 
+  void ResetRuntimeCalibration() {
+    for (DirectIkBinding &chain : ikBindings)
+      chain.targetCalibrated = false;
+  }
+
+  bool AnalyzeSourceTracks() {
+    analyzed = false;
+    prepared = false;
+    bindings.clear();
+    rootTransform = nullptr;
+    ikBindings[0] = {};
+    ikBindings[1] = {};
+    mappedTracks = unmappedTracks = unsupportedTracks = ikTracks = 0;
+    error.clear();
+    if (!vmd || !vmd->loaded) {
+      error = vmd ? vmd->error : "No VMD data";
+      return false;
+    }
+
+    std::vector<std::string> seen;
+    for (const DirectMapEntry &entry : g_directMap) {
+      if (vmd->boneTimelines.find(entry.vmdName) != vmd->boneTimelines.end())
+        MarkSupportedTrack(seen, entry.vmdName, mappedTracks);
+    }
+    for (int i = 0; i < g_fingerMapCount; ++i) {
+      const FingerMapEntry &entry = g_fingerMap[i];
+      if (strstr(entry.transformName, "Finger") &&
+          vmd->boneTimelines.find(entry.mmdName) != vmd->boneTimelines.end())
+        MarkSupportedTrack(seen, entry.mmdName, mappedTracks);
+    }
+    for (int side = 0; side < 2; ++side) {
+      for (int toe = 0; toe < 2; ++toe) {
+        std::string matchedName;
+        if (FindIkTrack(side != 0, toe != 0, matchedName)) {
+          MarkSupportedTrack(seen, matchedName, mappedTracks);
+          ++ikTracks;
+        }
+      }
+    }
+    for (const auto &timeline : vmd->boneTimelines) {
+      if (HasSeenTrack(seen, timeline.first))
+        continue;
+      if (IsUnsupportedName(timeline.first))
+        ++unsupportedTracks;
+      else
+        ++unmappedTracks;
+    }
+    if (mappedTracks == 0) {
+      error = "VMD has no supported standard bone tracks";
+      return false;
+    }
+    analyzed = true;
+    return true;
+  }
+
+  void ClearTargetBindings() {
+    prepared = false;
+    bindings.clear();
+    rootTransform = nullptr;
+    ikBindings[0] = {};
+    ikBindings[1] = {};
+  }
+
   bool BuildBindings() {
+    ClearTargetBindings();
+    error.clear();
     if (!vmd || !vmd->loaded || !g_cachedAnimator) {
       error = "No loaded VMD or active character Animator";
       return false;
@@ -507,10 +730,10 @@ struct DirectVmdMotion {
       return false;
     }
 
-    bindings.clear();
     rootTransform = root;
     mappedTracks = unmappedTracks = unsupportedTracks = ikTracks = 0;
     std::vector<std::string> seen;
+    Log("[VMD-DIRECT] Prepare phase 1/4: map humanoid tracks");
     for (const auto &entry : g_directMap)
       AddTrack(entry, root, seen);
     AddFingerTracks(root, seen);
@@ -529,9 +752,12 @@ struct DirectVmdMotion {
       return false;
     }
 
+    Log("[VMD-DIRECT] Prepare phase 2/4: Animator.Rebind/Update(0)");
     DirectRebindAnimatorToRest();
+    Log("[VMD-DIRECT] Prepare phase 2/4 complete");
 
     Quat rootWorld = {0, 0, 0, 1};
+    Log("[VMD-DIRECT] Prepare phase 3/4: capture bind rotations");
     const bool hasRootWorld = ReadWorldRotation(root, rootWorld);
     if (hasRootWorld)
       CalculateRootBasis(rootWorld);
@@ -547,6 +773,8 @@ struct DirectVmdMotion {
         ReadWorldRotation(parent, parentWorld);
       binding.parentBindFromRoot =
           QuatNormalize(QuatMul(QuatInv(rootWorld), parentWorld));
+      if (hasRootWorld)
+        CaptureArmAxes(binding, rootWorld);
       std::sort(binding.tracks.begin(), binding.tracks.end(),
                 [](const DirectSourceTrack &a, const DirectSourceTrack &b) {
                   return a.order < b.order;
@@ -563,6 +791,17 @@ struct DirectVmdMotion {
     }
     Log("[VMD-DIRECT] Standard leg IK tracks: %d mapped, display timelines=%zu",
         ikTracks, vmd->ikTimelines.size());
+    int axialTwistTracks = 0;
+    for (const DirectBoneBinding &binding : bindings) {
+      for (const DirectSourceTrack &track : binding.tracks) {
+        if (IsArmTwistTrack(track.name))
+          ++axialTwistTracks;
+      }
+    }
+    if (axialTwistTracks > 0) {
+      Log("[VMD-DIRECT] Axial-only arm/hand twist fallback: %d tracks",
+          axialTwistTracks);
+    }
 
     // MMD lower/upper body are siblings below center/groove, while Humanoid
     // Spine is a child of Hips. Mark the earliest available upper-body layer
@@ -589,8 +828,8 @@ struct DirectVmdMotion {
       if (height > 0.1f && height < 5.0f)
         positionScale = height / 20.0f;
     }
-    SafeSetAnimatorEnabled(false);
     prepared = true;
+    Log("[VMD-DIRECT] Prepare phase 4/4 complete");
     return true;
   }
 
@@ -703,14 +942,42 @@ struct DirectVmdMotion {
 
     for (size_t i = 0; i < bindings.size(); ++i) {
       const DirectBoneBinding &binding = bindings[i];
-      Quat combined = {0, 0, 0, 1};
+      Quat combinedRoot = {0, 0, 0, 1};
       Vec3 position = {0, 0, 0};
       Vec3 firstPosition = {0, 0, 0};
       bool hasPosition = false;
       for (const auto &track : binding.tracks) {
         const InterpResult current =
             InterpolateBone(track.timeline->keys, out.frame, track.hasPosition);
-        combined = ComposeVmdRotation(combined, current.rotation);
+        Quat unityRotation = VmdToUnityRotation(current.rotation);
+        Quat layerRoot;
+        if (IsElbowTrack(track.name)) {
+          const Vec3 sourceHinge =
+              IsLeftArmTrack(track.name) ? Vec3{0, 1, 0}
+                                         : Vec3{0, -1, 0};
+          unityRotation = ExtractTwistRotation(unityRotation, sourceHinge);
+          layerRoot = QuatNormalize(QuatMul(
+              QuatMul(rootBasis, unityRotation), QuatInv(rootBasis)));
+          if (binding.elbowHingeRetargetReady) {
+            layerRoot = QuatNormalize(QuatMul(
+                QuatMul(binding.elbowHingeRetargetRoot, layerRoot),
+                QuatInv(binding.elbowHingeRetargetRoot)));
+          }
+        } else if (IsArmTwistTrack(track.name)) {
+          unityRotation =
+              ExtractTwistRotation(unityRotation, {1, 0, 0});
+          layerRoot = QuatNormalize(QuatMul(
+              QuatMul(rootBasis, unityRotation), QuatInv(rootBasis)));
+          if (binding.armTwistRetargetReady) {
+            layerRoot = QuatNormalize(QuatMul(
+                QuatMul(binding.armTwistRetargetRoot, layerRoot),
+                QuatInv(binding.armTwistRetargetRoot)));
+          }
+        } else {
+          layerRoot = QuatNormalize(QuatMul(
+              QuatMul(rootBasis, unityRotation), QuatInv(rootBasis)));
+        }
+        combinedRoot = ComposeVmdRotation(combinedRoot, layerRoot);
         if (track.hasPosition) {
           const InterpResult first =
               InterpolateBone(track.timeline->keys, 0.0f, true);
@@ -728,9 +995,8 @@ struct DirectVmdMotion {
       if (binding.isRootChannel) {
         deltaRoot = rootAllApplied;
       } else {
-        const Quat targetRotation = SourceToRootRotation(combined);
         const Quat partRotation =
-            ScaleRotation(targetRotation, PartScale(binding.part));
+            ScaleRotation(combinedRoot, PartScale(binding.part));
         if (binding.cancelsLowerBody) {
           deltaRoot = QuatNormalize(QuatMul(
               QuatMul(QuatInv(rootAllApplied), rootCommonApplied),
@@ -896,7 +1162,7 @@ struct DirectVmdMotion {
     if (!prepared)
       return;
     SafeSetAnimatorEnabled(false);
-    for (const auto &bone : pose.bones) {
+    for (const DirectPoseBone &bone : pose.bones) {
       if (!bone.transform)
         continue;
       SafeSetLocalRotation(bone.transform, bone.localRotation);
@@ -931,21 +1197,38 @@ static const VmdFile *GetActiveMotionVmd() {
 }
 
 static DirectVmdMotion *CreateDirectVmdMotion(const char *path) {
-  DirectVmdMotion *motion = new DirectVmdMotion();
+  std::unique_ptr<DirectVmdMotion> motion(new DirectVmdMotion());
   motion->vmd = LoadVmd(path);
   if (!motion->vmd || !motion->vmd->loaded) {
     motion->error = motion->vmd ? motion->vmd->error : "VMD allocation failed";
-    return motion;
+    return motion.release();
   }
   motion->durationFrames =
       (std::max)(motion->vmd->boneFrames, motion->vmd->morphFrames);
-  if (!motion->BuildBindings())
-    return motion;
-  return motion;
+  if (!motion->AnalyzeSourceTracks())
+    return motion.release();
+  return motion.release();
+}
+
+// Takes ownership of an already parsed VMD. The GUI load path uses this to
+// avoid parsing a large action twice on the game window thread.
+static DirectVmdMotion *CreateDirectVmdMotion(VmdFile *parsedVmd) {
+  std::unique_ptr<VmdFile, void (*)(VmdFile *)> parsed(parsedVmd, FreeVmd);
+  std::unique_ptr<DirectVmdMotion> motion(new DirectVmdMotion());
+  motion->vmd = parsed.release();
+  if (!motion->vmd || !motion->vmd->loaded) {
+    motion->error = motion->vmd ? motion->vmd->error : "VMD allocation failed";
+    return motion.release();
+  }
+  motion->durationFrames =
+      (std::max)(motion->vmd->boneFrames, motion->vmd->morphFrames);
+  if (!motion->AnalyzeSourceTracks())
+    return motion.release();
+  return motion.release();
 }
 
 static void PublishDirectStats(const DirectVmdMotion *motion) {
-  if (!motion || !motion->prepared) {
+  if (!motion || !motion->analyzed || !motion->vmd) {
     g_directReady.store(false, std::memory_order_release);
     return;
   }

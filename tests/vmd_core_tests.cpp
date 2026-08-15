@@ -273,6 +273,29 @@ static void TestBezierAndRetargetMath() {
   const Quat expectedUpperWorld = QuatNormalize(QuatMul(common, upper));
   assert(fabsf(QuatDot(actualUpperWorld, expectedUpperWorld)) > 0.99999f);
 
+  const Quat sourceArmTwist = QuatNormalize({0.258819f, 0, 0, 0.9659258f});
+  const Quat sourceSwing = QuatNormalize({0, 0, 0.258819f, 0.9659258f});
+  const Quat swingThenTwist = QuatMul(sourceSwing, sourceArmTwist);
+  const Quat extractedTwist =
+      ExtractTwistRotation(swingThenTwist, {1, 0, 0});
+  assert(fabsf(QuatDot(extractedTwist, sourceArmTwist)) > 0.99999f);
+  const Vec3 twistKeepsAxis = QuatRotate(extractedTwist, {1, 0, 0});
+  assert(Vec3Dot(twistKeepsAxis, Vec3{1, 0, 0}) > 0.99999f);
+  const Quat rejectedSwing = ExtractTwistRotation(sourceSwing, {1, 0, 0});
+  assert(fabsf(QuatDot(rejectedSwing, Quat{0, 0, 0, 1})) > 0.99999f);
+
+  // Standard MMD elbow keys often contain source-model local-axis components.
+  // Projecting each side onto its anatomical hinge must bend both forearms in
+  // the same forward direction rather than toward the torso.
+  const Quat leftElbowRaw = {0.55117f, 0.66378f, 0.03300f, 0.50449f};
+  const Quat rightElbowRaw = {0.25085f, -0.33799f, 0.35593f, 0.83435f};
+  const Quat leftElbow = ExtractTwistRotation(
+      VmdToUnityRotation(leftElbowRaw), {0, 1, 0});
+  const Quat rightElbow = ExtractTwistRotation(
+      VmdToUnityRotation(rightElbowRaw), {0, -1, 0});
+  assert(QuatRotate(leftElbow, {-1, 0, 0}).z > 0.0f);
+  assert(QuatRotate(rightElbow, {1, 0, 0}).z > 0.0f);
+
   const Quat turnForwardToRight = QuatFromTo({0, 0, 1}, {1, 0, 0});
   const Vec3 turned = QuatRotate(turnForwardToRight, {0, 0, 1});
   assert(Near(turned.x, 1.0f));

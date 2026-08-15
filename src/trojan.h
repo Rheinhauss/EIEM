@@ -1748,7 +1748,7 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case (WM_USER + 100): 
       Log("[GUI-CMD] Play");
       if (IsDirectVmdMode()) {
-        if (!g_directMotion || !g_directMotion->prepared ||
+        if (!g_directMotion || !g_directMotion->analyzed ||
             !g_directReady.load(std::memory_order_acquire)) {
           Log("[VMD-DIRECT] Play failed: load a direct VMD first");
           return 0;
@@ -1761,7 +1761,8 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         g_directPlayer->speed = g_playbackSpeed;
         g_directPlayer->loop = g_playbackLoop;
         directWasPlaying = g_directPlayer->playing;
-        directResume = !g_directPlayer->playing &&
+        directResume = g_directMotion->prepared &&
+                       !g_directPlayer->playing &&
                        g_directPlayer->currentTime > 0.0f &&
                        g_directPlayer->currentTime <
                            g_directMotion->Duration() - 0.001f;
@@ -1779,6 +1780,28 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
             Log("[VMD-DIRECT] Play failed: no active character Animator");
             return 0;
           }
+          Log("[VMD-DIRECT] Preparing character bindings on first Play");
+          bool bindingReady = false;
+          try {
+            bindingReady = g_directMotion->BuildBindings();
+          } catch (const std::exception &exception) {
+            g_directMotion->error = exception.what();
+          } catch (...) {
+            g_directMotion->error = "Unexpected error while binding character";
+          }
+          if (!bindingReady) {
+            const std::string &error = g_directMotion->error;
+            strncpy(g_directLastError,
+                    error.empty() ? "Cannot bind VMD to character"
+                                  : error.c_str(),
+                    sizeof(g_directLastError) - 1);
+            g_directLastError[sizeof(g_directLastError) - 1] = '\0';
+            SafeSetAnimatorEnabled(true);
+            Log("[VMD-DIRECT] Play prepare failed: %s", g_directLastError);
+            return 0;
+          }
+          g_directMotion->ResetRuntimeCalibration();
+          PublishDirectStats(g_directMotion);
           PrepareDirectExternalComponents();
           SafeSetAnimatorEnabled(false);
           g_trojanActive = true;
@@ -1917,34 +1940,62 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     case (WM_USER + 110): {
       Log("[GUI-CMD] Load direct VMD: %s", g_directVmdPath);
       g_directLastError[0] = '\0';
-      VmdFile *probe = LoadVmd(g_directVmdPath);
-      if (!probe || !probe->loaded || probe->boneTimelines.empty()) {
-        const std::string error = probe
-            ? (probe->error.empty() ? "VMD contains no bone tracks" : probe->error)
-            : "VMD allocation failed";
+      VmdFile *parsed = nullptr;
+      DirectVmdMotion *candidate = nullptr;
+      try {
+        parsed = LoadVmd(g_directVmdPath);
+      } catch (const std::exception &exception) {
+        strncpy(g_directLastError, exception.what(),
+                sizeof(g_directLastError) - 1);
+      } catch (...) {
+        strncpy(g_directLastError, "Unexpected VMD parser error",
+                sizeof(g_directLastError) - 1);
+      }
+      g_directLastError[sizeof(g_directLastError) - 1] = '\0';
+      if (!parsed || !parsed->loaded || parsed->boneTimelines.empty()) {
+        const std::string error = g_directLastError[0]
+            ? g_directLastError
+            : (parsed
+                ? (parsed->error.empty() ? "VMD contains no bone tracks"
+                                         : parsed->error)
+                : "VMD allocation failed");
         strncpy(g_directLastError, error.c_str(), sizeof(g_directLastError) - 1);
-        if (probe) FreeVmd(probe);
+        g_directLastError[sizeof(g_directLastError) - 1] = '\0';
+        if (parsed) FreeVmd(parsed);
         Log("[VMD-DIRECT] Load failed: %s", g_directLastError);
         return 0;
       }
-      FreeVmd(probe);
 
-      RefreshEntityAnimator();
-      DirectVmdMotion *candidate = CreateDirectVmdMotion(g_directVmdPath);
-      if (!candidate || !candidate->prepared) {
+      try {
+        // Ownership of parsed is transferred even if analysis throws.
+        candidate = CreateDirectVmdMotion(parsed);
+        parsed = nullptr;
+      } catch (const std::exception &exception) {
+        strncpy(g_directLastError, exception.what(),
+                sizeof(g_directLastError) - 1);
+      } catch (...) {
+        strncpy(g_directLastError, "Unexpected VMD analysis error",
+                sizeof(g_directLastError) - 1);
+      }
+      g_directLastError[sizeof(g_directLastError) - 1] = '\0';
+      if (!candidate || !candidate->analyzed) {
         const std::string error = candidate ? candidate->error
-                                            : "Direct motion allocation failed";
+            : (g_directLastError[0] ? g_directLastError
+                                    : "Direct motion allocation failed");
         strncpy(g_directLastError, error.c_str(), sizeof(g_directLastError) - 1);
+        g_directLastError[sizeof(g_directLastError) - 1] = '\0';
         delete candidate;
-        SafeSetAnimatorEnabled(true);
-        Log("[VMD-DIRECT] Prepare failed: %s", g_directLastError);
+        Log("[VMD-DIRECT] Analysis failed: %s", g_directLastError);
         return 0;
       }
 
-      // Only disturb the active player after parsing, mapping and bind capture
-      // all succeeded. A bad direct VMD therefore preserves the old action and
-      // selected mode.
-      StopAllMotionPlayback();
+      // Loading is deliberately pure C++: no Animator, Transform, IK or
+      // component API is touched here. Character binding is deferred until
+      // the first Play command.
+      if (g_trojanActive)
+        StopAllMotionPlayback();
+      else
+        InvalidateDirectPlayback();
       if (g_morphVmdPath[0] == '\0' && g_morphVmd) {
         FreeVmd(g_morphVmd);
         g_morphVmd = nullptr;
@@ -1958,8 +2009,7 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
         g_directPlayer = new MmdPlayer();
       g_directPlayer->speed = g_playbackSpeed;
       g_directPlayer->loop = g_playbackLoop;
-      SafeSetAnimatorEnabled(true);
-      Log("[VMD-DIRECT] Ready: frames=%u mapped=%d unmapped=%d unsupported=%d",
+      Log("[VMD-DIRECT] Loaded: frames=%u supported=%d unmapped=%d unsupported=%d",
           g_directMotion->durationFrames, g_directMotion->mappedTracks,
           g_directMotion->unmappedTracks, g_directMotion->unsupportedTracks);
       return 0;
@@ -1984,7 +2034,7 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       QueryPerformanceCounter(&player->lastTick);
       if (IsDirectVmdMode())
         ReleaseSRWLockExclusive(&g_directClockLock);
-      if (IsDirectVmdMode() && g_directMotion) {
+      if (IsDirectVmdMode() && g_directMotion && g_directMotion->prepared) {
         const uint32_t generation =
             g_directGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_directPosePending.store(false, std::memory_order_release);
@@ -2072,19 +2122,12 @@ static LRESULT CALLBACK MmdWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       RefreshEntityAnimator();
       if (g_cachedAnimator) {
         Log("[GUI-CMD] New character captured: animator=%p", g_cachedAnimator);
-        if (IsDirectVmdMode() && g_directVmdPath[0]) {
-          DirectVmdMotion *candidate = CreateDirectVmdMotion(g_directVmdPath);
-          if (candidate && candidate->prepared) {
-            ReplaceDirectMotion(candidate);
-            PublishDirectStats(g_directMotion);
-          } else {
-            if (candidate) {
-              strncpy(g_directLastError, candidate->error.c_str(),
-                      sizeof(g_directLastError) - 1);
-              delete candidate;
-            }
-            g_directReady.store(false, std::memory_order_release);
-          }
+        if (IsDirectVmdMode() && g_directMotion) {
+          AcquireSRWLockExclusive(&g_directMotionLock);
+          g_directMotion->ClearTargetBindings();
+          ReleaseSRWLockExclusive(&g_directMotionLock);
+          PublishDirectStats(g_directMotion);
+          Log("[VMD-DIRECT] Character binding deferred until Play");
         }
       } else {
         Log("[GUI-CMD] No character found. Switch to a character first.");

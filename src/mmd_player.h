@@ -204,6 +204,27 @@ static Quat ComposeVmdRotation(Quat accumulated, Quat nextLayer) {
   return QuatNormalize(QuatMul(accumulated, nextLayer));
 }
 
+// A VMD arm/hand twist bone is a child placed on the limb's long axis. When
+// the target Humanoid has no equivalent twist Transform, copying the complete
+// quaternion onto the upper/lower arm turns source-model local-axis swing into
+// an extra limb bend. Preserve only the axial component so the track rolls the
+// limb without moving the elbow or wrist off its animated direction.
+static Quat ExtractTwistRotation(Quat rotation, Vec3 axis) {
+  rotation = QuatNormalize(rotation);
+  axis = Vec3Normalize(axis);
+  if (Vec3Dot(axis, axis) < 0.5f)
+    return {0, 0, 0, 1};
+  const float projected =
+      rotation.x * axis.x + rotation.y * axis.y + rotation.z * axis.z;
+  Quat twist = {axis.x * projected, axis.y * projected,
+                axis.z * projected, rotation.w};
+  const float lengthSquared = twist.x * twist.x + twist.y * twist.y +
+                              twist.z * twist.z + twist.w * twist.w;
+  if (lengthSquared < 1e-10f)
+    return {0, 0, 0, 1};
+  return QuatNormalize(twist);
+}
+
 // VMD/MMD body coordinates face the opposite X/Z directions from Unity's
 // canonical humanoid coordinates. This is a 180-degree basis rotation around
 // Y: positions (-x,y,-z), rotations (-x,y,-z,w).
