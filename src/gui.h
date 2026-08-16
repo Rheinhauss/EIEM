@@ -1327,8 +1327,8 @@ static DWORD WINAPI GuiThread(LPVOID) {
 
   RECT gr;
   GetWindowRect(g_gameHwnd, &gr);
-  int panelW = 380;
-  int panelH = 580;
+  int panelW = 600;
+  int panelH = 600;
   int posX = gr.right - panelW - 20;
   int posY = gr.top + 40;
 
